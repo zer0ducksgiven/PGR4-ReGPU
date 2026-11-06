@@ -14,6 +14,7 @@
 
 PPC_FUNC_IMPL(__imp__sub_822DC420);
 PPC_FUNC_IMPL(__imp__sub_822DE628);
+PPC_FUNC_IMPL(__imp__sub_822F9D70);
 
 namespace
 {
@@ -84,7 +85,17 @@ PPC_FUNC(sub_822DE628)
             held.up = held.down = 0;
 }
 
-// Whether a player's pad is driving a car (a race): its controls update every frame then. The menus' background
+// A bike's controls: its own update, which never reaches sub_822DC420. A pad index of -1 is an AI rider.
+PPC_FUNC(sub_822F9D70)
+{
+    const uint32_t bike = ctx.r3.u32;
+    const int32_t pad = int32_t(LoadBE32(bike + 3904));
+    if (pad >= 0 && pad < 4 && LoadBE32(bike + 20) == 0 && (ctx.r4.u32 & 0xFF) != 0)
+        g_lastPadDrive.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    __imp__sub_822F9D70(ctx, base);
+}
+
+// Whether a player's pad is driving a vehicle (a race): its controls update every frame then. The menus' background
 // cars are not driven by a pad.
 bool CarsDriving()
 {
