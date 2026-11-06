@@ -131,7 +131,7 @@ void PatchUiStrings(uint8_t* data, uint32_t size)
     ReplaceText(data, size, "EXIT DEMO", "QUIT GAME");
     ReplaceText(data, size, "Quit the PGR 4 Demo", "Close PGR 4");
     // Options > Graphics is the PC's resolution and anti-aliasing (graphics_menu.cpp).
-    ReplaceText(data, size, "Adjust your TV settings to optimize PGR 4's graphical look", "Resolution, anti-aliasing and display mode");
+    ReplaceText(data, size, "Adjust your TV settings to optimize PGR 4's graphical look", "Resolution, display, filtering and frame rate");
 }
 
 // The main menu's Quit item: SetNextScreen("Quit") is caught by the script lookup below and closes the game.

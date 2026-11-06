@@ -1,8 +1,8 @@
-// The Options > Graphics screen: the 360's TV calibration picture is replaced with the PC's resolution, display mode and
-// anti-aliasing, as a spinner box in the style of the game's Advanced Sound screen (Lua in GraphicsMenuPatch,
+// The Options > Graphics screen: the 360's TV calibration picture is replaced with the PC's resolution, display mode,
+// anti-aliasing, texture filtering and frame cap, as a spinner box in the style of the game's Advanced Sound screen (Lua in GraphicsMenuPatch,
 // run after Options\Graphics.lua). Its texts are this port's own: text ids from kTextBase are answered by the
 // game's string lookup hook below. Saving reports the choice through a caught Lua error ("PGR4SET ...", seen by
-// the luaD_throw hook in lua.cpp), and all three apply at once.
+// the luaD_throw hook in lua.cpp), and all of them apply at once.
 #include <windows.h>
 
 #include <algorithm>
@@ -31,6 +31,8 @@ std::map<std::string, uint32_t> g_textIds;
 
 std::vector<std::pair<uint32_t, uint32_t>> g_resolutions;
 const uint32_t kMsaa[] = { 1, 2, 4, 8 };
+const int kAniso[] = { -1, 0, 2, 4, 8, 16 }; // as the launcher lists them
+std::vector<uint32_t> g_fps;
 
 // A text id for this string (made once), for the game's UI.
 uint32_t Text(const std::string& s)
@@ -91,6 +93,13 @@ PPC_FUNC(sub_8289B1D0)
 std::string GraphicsMenuPatch()
 {
     ListResolutions();
+    // The launcher's caps, and the current one if it set a custom cap.
+    g_fps = { 30, 60, 120, 144, 165, 240, 360 };
+    if (std::find(g_fps.begin(), g_fps.end(), GetSettings().maxFps) == g_fps.end())
+    {
+        g_fps.push_back(GetSettings().maxFps);
+        std::sort(g_fps.begin(), g_fps.end());
+    }
     const Settings& s = GetSettings();
     std::string res, aa;
     size_t resNow = 0, aaNow = 0;
@@ -107,20 +116,37 @@ std::string GraphicsMenuPatch()
         if (kMsaa[i] == s.msaa)
             aaNow = i;
     }
+    std::string af, fps;
+    size_t afNow = 0, fpsNow = 0;
+    for (size_t i = 0; i < std::size(kAniso); i++)
+    {
+        const int v = kAniso[i];
+        af += std::to_string(Text(v < 0 ? "GAME DEFAULT" : v == 0 ? "OFF" : std::to_string(v) + "X")) + ",";
+        if (v == s.anisotropy)
+            afNow = i;
+    }
+    for (size_t i = 0; i < g_fps.size(); i++)
+    {
+        fps += std::to_string(Text(std::to_string(g_fps[i]) + " FPS")) + ",";
+        if (g_fps[i] == s.maxFps)
+            fpsNow = i;
+    }
     const std::string mode = std::to_string(Text("WINDOWED")) + "," + std::to_string(Text("FULLSCREEN")) + ",";
     std::string lua = "local RES = {" + res + "}\nlocal AA = {" + aa + "}\nlocal MODE = {" + mode + "}\n";
     lua += "local RES_NOW, AA_NOW, MODE_NOW = " + std::to_string(resNow) + ", " + std::to_string(aaNow) + ", " + (s.fullscreen ? "1" : "0") + "\n";
+    lua += "local AF = {" + af + "}\nlocal FPS = {" + fps + "}\nlocal AF_NOW, FPS_NOW = " + std::to_string(afNow) + ", " + std::to_string(fpsNow) + "\n";
+    lua += "local T_AF, T_FPS = " + std::to_string(Text("ANISOTROPIC FILTERING")) + ", " + std::to_string(Text("FRAME RATE CAP")) + "\n";
     lua += "local T_RES, T_AA, T_MODE = " + std::to_string(Text("RESOLUTION")) + ", " + std::to_string(Text("ANTI-ALIASING")) + ", " +
         std::to_string(Text("DISPLAY MODE")) + "\n";
     lua += R"lua(
-GUI = { finished = false, optionChosen = 0, maxOption = 2 }
+GUI = { finished = false, optionChosen = 0, maxOption = 4 }
 function Init()
     SetupFadePanel()
     SetupTitle(UIText.IDS_GRAPHICS)
     SetupScreenTimers()
     SetupSlideMenuInfo()
     SetupInfoText(UIText.IDS_CANCEL_B_SAVE_A, 1, false)
-    local frame = GetDefaultFrame(113.33333333333334, UIGlobals.screen.safe_top + 40, 453.3333333333333, UIGlobals.screen.safe_bottom - 210)
+    local frame = GetDefaultFrame(113.33333333333334, UIGlobals.screen.safe_top + 40, 453.3333333333333, UIGlobals.screen.safe_bottom - 110)
     frame.panel = 1
     UIButtons.AddButton(frame)
     SetupFrameTitle(frame, UIText.IDS_GRAPHICS)
@@ -135,6 +161,14 @@ function Init()
     y = y + UIGlobals.options_cr
     GUI.mode_ID = SetupVariableSpinner(T_MODE, y, 320, 174, 1)
     for i = #MODE, 1, -1 do UIButtons.AddItem(GUI.mode_ID, i - 1, MODE[i], false) end
+    y = y + UIGlobals.options_cr
+    GUI.af_ID = SetupVariableSpinner(T_AF, y, 320, 174, 1)
+    for i = #AF, 1, -1 do UIButtons.AddItem(GUI.af_ID, i - 1, AF[i], false) end
+    y = y + UIGlobals.options_cr
+    GUI.fps_ID = SetupVariableSpinner(T_FPS, y, 320, 174, 1)
+    for i = #FPS, 1, -1 do UIButtons.AddItem(GUI.fps_ID, i - 1, FPS[i], false) end
+    UIButtons.SetSelection(GUI.af_ID, AF_NOW)
+    UIButtons.SetSelection(GUI.fps_ID, FPS_NOW)
     UIButtons.SetSelection(GUI.res_ID, RES_NOW)
     UIButtons.SetSelection(GUI.aa_ID, AA_NOW)
     UIButtons.SetSelection(GUI.mode_ID, MODE_NOW)
@@ -145,6 +179,8 @@ function ActivateOptions()
     UIButtons.SetSelected(GUI.res_ID, GUI.optionChosen == 0)
     UIButtons.SetSelected(GUI.aa_ID, GUI.optionChosen == 1)
     UIButtons.SetSelected(GUI.mode_ID, GUI.optionChosen == 2)
+    UIButtons.SetSelected(GUI.af_ID, GUI.optionChosen == 3)
+    UIButtons.SetSelected(GUI.fps_ID, GUI.optionChosen == 4)
 end
 function MessageUpdate(msg)
     if GUI.finished == true then return end
@@ -163,7 +199,7 @@ function MessageUpdate(msg)
         GUI.finished = true
         EndFadePanel(true)
         PlayMenuNext()
-        pcall(error, "PGR4SET " .. UIButtons.GetSelection(GUI.res_ID) .. " " .. UIButtons.GetSelection(GUI.aa_ID) .. " " .. UIButtons.GetSelection(GUI.mode_ID), 0)
+        pcall(error, "PGR4SET " .. UIButtons.GetSelection(GUI.res_ID) .. " " .. UIButtons.GetSelection(GUI.aa_ID) .. " " .. UIButtons.GetSelection(GUI.mode_ID) .. " " .. UIButtons.GetSelection(GUI.af_ID) .. " " .. UIButtons.GetSelection(GUI.fps_ID), 0)
         UIScreen.SetNextScreen("Options\\MainMenu.lua")
     end
 end
@@ -175,15 +211,15 @@ function EndLoop() return true end
     return lua;
 }
 
-// "PGR4SET <resolution> <anti-aliasing> <display mode: 0 windowed, 1 fullscreen>" (indices) from the screen's Save.
+// "PGR4SET <resolution> <anti-aliasing> <display mode: 0 windowed, 1 fullscreen> <filtering> <frame cap>" (indices) from the screen's Save.
 bool GraphicsMenuCommand(const char* text, size_t len)
 {
     constexpr char kTag[] = "PGR4SET ";
     if (len < sizeof kTag - 1 || memcmp(text, kTag, sizeof kTag - 1) != 0)
         return false;
-    double r = -1, a = -1, m = -1;
+    double r = -1, a = -1, m = -1, f = -1, c = -1;
     const std::string args(text + sizeof kTag - 1, len - (sizeof kTag - 1));
-    if (sscanf(args.c_str(), "%lf %lf %lf", &r, &a, &m) != 3)
+    if (sscanf(args.c_str(), "%lf %lf %lf %lf %lf", &r, &a, &m, &f, &c) != 5)
         return true;
     Settings& s = GetSettings();
     if (r >= 0 && size_t(r) < g_resolutions.size())
@@ -206,8 +242,18 @@ bool GraphicsMenuCommand(const char* text, size_t len)
     if ((m == 0 || m == 1) && (m == 1) != s.fullscreen) // after the size above: a new window takes it
         regpu::SetFullscreen(m == 1);
     s.fullscreen = m == 1 ? true : m == 0 ? false : s.fullscreen;
+    if (f >= 0 && size_t(f) < std::size(kAniso) && kAniso[size_t(f)] != s.anisotropy)
+    {
+        s.anisotropy = kAniso[size_t(f)];
+        regpu::SetAnisotropy(s.anisotropy);
+    }
+    if (c >= 0 && size_t(c) < g_fps.size() && g_fps[size_t(c)] != s.maxFps)
+    {
+        s.maxFps = g_fps[size_t(c)];
+        regpu::SetFrameLimit(s.maxFps, s.vsync);
+    }
     SaveSettings();
-    Log("ui: graphics options saved: %ux%u, %s, MSAA %ux", s.width, s.height,
-        s.fullscreen ? "fullscreen" : "windowed", s.msaa);
+    Log("ui: graphics options saved: %ux%u, %s, MSAA %ux, filtering %d, cap %u fps", s.width, s.height,
+        s.fullscreen ? "fullscreen" : "windowed", s.msaa, s.anisotropy, s.maxFps);
     return true;
 }
