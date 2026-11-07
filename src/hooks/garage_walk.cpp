@@ -9,6 +9,8 @@
 
 PPC_FUNC_IMPL(__imp__sub_824BB618);
 
+void NoteGarageWalk(); // gear_latch.cpp: no menu hold delay while walking
+
 static float LoadFloat(uint32_t address)
 {
     const uint32_t v = __builtin_bswap32(*GuestPtr<uint32_t>(address));
@@ -27,6 +29,7 @@ static void StoreFloat(uint32_t address, float f)
 // sub_824BB618(position in/out r3, move r4, ...)
 PPC_FUNC(sub_824BB618)
 {
+    NoteGarageWalk();
     static float saved[3];
     const uint32_t move = ctx.r4.u32;
     const float total[3] = { LoadFloat(move) + saved[0], LoadFloat(move + 4) + saved[1], LoadFloat(move + 8) + saved[2] };

@@ -95,8 +95,14 @@ PPC_FUNC(sub_822F9D70)
     __imp__sub_822F9D70(ctx, base);
 }
 
-// Whether a player's pad is driving a vehicle (a race): its controls update every frame then. The menus' background
-// cars are not driven by a pad.
+// The garage's walking camera moves by the stick too (garage_walk.cpp).
+void NoteGarageWalk()
+{
+    g_lastPadDrive.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+}
+
+// Whether a player's pad is driving a vehicle (a race) or walking a garage: its controls update every frame then. The
+// menus' background cars are not driven by a pad.
 bool CarsDriving()
 {
     const auto last = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(g_lastPadDrive.load(std::memory_order_relaxed)));
