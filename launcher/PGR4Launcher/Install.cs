@@ -337,23 +337,68 @@ public static class Dlc
 
     /// <summary>Installs packages (as downloaded from Xbox Live, or backported mods): unpacked into the DLC folder the
     /// way the game reads them. Before, the package file was only copied there and the game never saw it.</summary>
-    public static (int Added, List<string> Errors) Add(IEnumerable<string> files, bool mods)
+    public static (int Added, List<string> Errors) Add(IEnumerable<string> files, bool mods, string? dlcDir = null)
     {
         if (Game.Running) throw new InvalidOperationException("Close the game first: DLC is read while it runs.");
-        Directory.CreateDirectory(Paths.Dlc);
+        dlcDir ??= Paths.Dlc;
+        Directory.CreateDirectory(dlcDir);
         int added = 0;
         var errors = new List<string>();
         foreach (var f in files.Where(File.Exists))
         {
             try
             {
-                if (KelloggsZip.TryInstall(f, Paths.Dlc)) { added++; continue; }
-                Stfs.Install(f, Paths.Dlc, mods);
+                if (KelloggsZip.TryInstall(f, dlcDir)) { added++; continue; }
+                if (f.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    added += AddFromZip(f, dlcDir, mods, errors);
+                    continue;
+                }
+                Stfs.Install(f, dlcDir, mods);
                 added++;
             }
             catch (Exception ex) { errors.Add($"{Path.GetFileName(f)}: {ex.Message}"); }
         }
         return (added, errors);
+    }
+
+    /// <summary>DLC is often shared as a zip of packages: every package inside (in any folder, or in a zip inside it) is
+    /// installed. Each is unpacked to a temporary file first, as Stfs reads a file.</summary>
+    static int AddFromZip(string file, string dlcDir, bool mods, List<string> errors, int depth = 0)
+    {
+        int added = 0, found = 0;
+        using var zip = System.IO.Compression.ZipFile.OpenRead(file);
+        foreach (var e in zip.Entries.Where(e => e.Length >= 0x1800 || e.FullName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)))
+        {
+            var label = $"{Path.GetFileName(file)} > {e.FullName}";
+            // under its own name: the installed package is named after the file
+            var tmpDir = Path.Combine(Path.GetTempPath(), "pgr4-dlc-" + Guid.NewGuid().ToString("N"));
+            var tmp = Path.Combine(tmpDir, Path.GetFileName(e.FullName));
+            try
+            {
+                Directory.CreateDirectory(tmpDir);
+                if (tmp.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (depth >= 2) continue;
+                    System.IO.Compression.ZipFileExtensions.ExtractToFile(e, tmp, true);
+                    found++;
+                    if (KelloggsZip.TryInstall(tmp, dlcDir)) { added++; continue; }
+                    added += AddFromZip(tmp, dlcDir, mods, errors, depth + 1);
+                    continue;
+                }
+                var magic = new byte[4];
+                using (var s = e.Open()) s.ReadExactly(magic);
+                if (Encoding.ASCII.GetString(magic) is not ("LIVE" or "PIRS" or "CON ")) continue;
+                found++;
+                System.IO.Compression.ZipFileExtensions.ExtractToFile(e, tmp, true);
+                Stfs.Install(tmp, dlcDir, mods);
+                added++;
+            }
+            catch (Exception ex) { errors.Add($"{label}: {ex.Message}"); }
+            finally { try { Directory.Delete(tmpDir, true); } catch { } }
+        }
+        if (found == 0 && depth == 0) errors.Add($"{Path.GetFileName(file)}: no Xbox 360 packages inside.");
+        return added;
     }
 
     /// <summary>Deletes an installed pack and its files (the Mods panel's Remove).</summary>
