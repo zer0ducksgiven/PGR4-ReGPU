@@ -93,6 +93,12 @@ void RuntimeInit(const std::filesystem::path& gameDir)
 const std::filesystem::path& GameDir() { return g_gameDir; }
 const std::filesystem::path& UserDir() { return g_userDir; }
 const std::filesystem::path& ContentDir() { return g_contentDir; }
+const std::filesystem::path& ContentDir2()
+{
+    // Never the folder player 1 plays from.
+    static const std::filesystem::path dir = g_userDir / "profiles" / (GetSettings().profile == "Player 2" ? "Player 2 (split screen)" : "Player 2") / "content";
+    return dir;
+}
 const std::filesystem::path& DlcDir()
 {
     static const std::filesystem::path dir = g_userDir / "dlc";

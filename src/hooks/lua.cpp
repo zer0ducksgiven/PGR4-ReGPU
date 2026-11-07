@@ -137,6 +137,15 @@ void PatchUiStrings(uint8_t* data, uint32_t size)
 // The main menu's Quit item: SetNextScreen("Quit") is caught by the script lookup below and closes the game.
 static const char kMainMenuPatch[] = R"lua(
 local quitId = 9
+-- A second pad signs Player 2 in, and this menu greys out single player with two profiles until one signs out through
+-- the Xbox Guide, which isn't here. Player 2 just sits out.
+local function asOneProfile(f, a, b, c, d, e)
+    local numActive = Profile.NumActive
+    Profile.NumActive = function() return 1 end
+    local result = f(a, b, c, d, e)
+    Profile.NumActive = numActive
+    return result
+end
 local init = Init
 function Init()
     init()
@@ -152,7 +161,11 @@ function MessageUpdate(msg, a, b, c, d)
         UIScreen.SetNextScreen("PGR4Quit")
         return false
     end
-    return update(msg, a, b, c, d)
+    return asOneProfile(update, msg, a, b, c, d)
+end
+local frameUpdate = FrameUpdate
+function FrameUpdate(a, b, c, d)
+    return asOneProfile(frameUpdate, a, b, c, d)
 end
 )lua";
 
@@ -181,6 +194,9 @@ PPC_FUNC(sub_82508308)
     }
 }
 
+void TitleScreenReached(); // kernel/imports_xam.cpp
+void SetProfileScreens(bool on);
+
 PPC_FUNC_IMPL(__imp__sub_82508568);
 
 // Runs a named script from the loaded packages (UIEnums.lua, UISetup.lua, ...); the caller ignores failure.
@@ -189,6 +205,12 @@ PPC_FUNC(sub_82508568)
     std::string name = ctx.r4.u32 ? GuestPtr<const char>(ctx.r4.u32) : "";
     const uint32_t L = ctx.r3.u32;
     g_runningScript = name;
+    if (EndsWith(name, "Intro\\StartScreen.lua"))
+        TitleScreenReached();
+    else if (name.find("Intro\\Profile") != std::string::npos)
+        SetProfileScreens(true);
+    else if (EndsWith(name, "Intro\\MainMenu.lua"))
+        SetProfileScreens(false);
     __imp__sub_82508568(ctx, base);
     g_runningScript.clear();
     if (ctx.r3.u32 == 0 && EndsWith(name, "Intro\\MainMenu.lua"))

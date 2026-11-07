@@ -9,5 +9,6 @@ const std::filesystem::path& GameDir();
 const std::filesystem::path& UserDir();
 // The signed-in profile's saves (\Device\Content).
 const std::filesystem::path& ContentDir();
+const std::filesystem::path& ContentDir2(); // Player 2's saves (split screen)
 // Downloadable content shared by every profile (\Device\Dlc; one folder per package).
 const std::filesystem::path& DlcDir();

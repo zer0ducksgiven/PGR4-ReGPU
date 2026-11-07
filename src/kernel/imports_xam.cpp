@@ -34,10 +34,17 @@ namespace
 // The profile's offline XUID (0xE000...). The saves are signed for their owner, so it is kept in
 // the profile folder (profiles\<name>\xuid): a copied, renamed or imported profile stays valid.
 // A profile without the file gets the one derived from its name (what every profile had before).
-uint64_t Xuid()
+const char kPlayer2Name[] = "Player 2";
+
+// Users 0 and 1 are the signed-in profiles; anything else counts as player 1's.
+const std::filesystem::path& ContentDirOf(uint32_t user) { return user == 1 ? ContentDir2() : ContentDir(); }
+
+uint64_t MakeXuid(const std::filesystem::path& content, const std::string& name)
 {
-    static const uint64_t xuid = [] {
-        const auto file = ContentDir().parent_path() / "xuid";
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(content.parent_path(), ec);
+        const auto file = content.parent_path() / "xuid";
         if (FILE* f = _wfopen(file.c_str(), L"r"))
         {
             unsigned long long v = 0;
@@ -47,7 +54,7 @@ uint64_t Xuid()
                 return uint64_t(v);
         }
         uint64_t h = 0xCBF29CE484222325ull;
-        for (char c : GetSettings().profile)
+        for (char c : name)
             h = (h ^ uint8_t(c)) * 0x100000001B3ull;
         const uint64_t derived = 0xE000000000000000ull | (h & 0x0000FFFFFFFFFFFFull);
         if (FILE* f = _wfopen(file.c_str(), L"w"))
@@ -56,8 +63,16 @@ uint64_t Xuid()
             fclose(f);
         }
         return derived;
-    }();
-    return xuid;
+    }
+}
+
+uint64_t Xuid(uint32_t user = 0)
+{
+    static const uint64_t first = MakeXuid(ContentDir(), GetSettings().profile);
+    if (user != 1)
+        return first;
+    static const uint64_t second = MakeXuid(ContentDir2(), kPlayer2Name);
+    return second;
 }
 
 constexpr uint32_t kContentDataSize = 0x134;
@@ -71,15 +86,15 @@ struct ContentItem
     std::string fileName;
 };
 
-std::filesystem::path ContentTypeDir(uint32_t type)
+std::filesystem::path ContentTypeDir(uint32_t type, uint32_t user)
 {
     char t[16];
     snprintf(t, sizeof(t), "%08X", type);
-    return ContentDir() / t;
+    return ContentDirOf(user) / t;
 }
 
 // Display names live beside the packages (<fileName>.title, UTF-16 LE), outside what the game sees.
-std::filesystem::path TitlePath(uint32_t type, const std::string& fileName) { return ContentTypeDir(type) / (fileName + ".title"); }
+std::filesystem::path TitlePath(uint32_t type, const std::string& fileName, uint32_t user) { return ContentTypeDir(type, user) / (fileName + ".title"); }
 
 struct ListenerObject : KernelObject
 {
@@ -100,32 +115,37 @@ std::mutex g_listenerMutex;
 
 // Users ------------------------------------------------------------------------
 
+bool PlayerTwoSignedIn(); // below, with the pads
+
+static bool UserSignedIn(uint32_t user) { return user == 0 || (user == 1 && PlayerTwoSignedIn()); }
+static const char* UserName(uint32_t user) { return user == 1 ? kPlayer2Name : GetSettings().profile.c_str(); }
+
 GUEST_EXPORT(XamUserGetSigninState)
 {
-    Return(ctx, ctx.r3.u32 == 0 ? 1 : 0); // signed in locally
+    Return(ctx, UserSignedIn(ctx.r3.u32) ? 1 : 0); // signed in locally
 }
 
 GUEST_EXPORT(XamUserGetXUID)
 {
     // (user, type, xuid*)
-    if (ctx.r3.u32 != 0)
+    if (!UserSignedIn(ctx.r3.u32))
     {
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
     }
-    StoreBE64(ctx.r5.u32, Xuid());
+    StoreBE64(ctx.r5.u32, Xuid(ctx.r3.u32));
     Return(ctx, X_ERROR_SUCCESS);
 }
 
 GUEST_EXPORT(XamUserGetName)
 {
     // (user, buffer, size)
-    if (ctx.r3.u32 != 0)
+    if (!UserSignedIn(ctx.r3.u32))
     {
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
     }
-    const char* name = GetSettings().profile.c_str();
+    const char* name = UserName(ctx.r3.u32);
     const uint32_t size = ctx.r5.u32;
     if (size)
     {
@@ -139,15 +159,15 @@ GUEST_EXPORT(XamUserGetSigninInfo)
 {
     // (user, flags, X_USER_SIGNIN_INFO*): { u64 xuid; u32 ?; u32 signinState; u32 ?; u32 ?; char name[16] }
     const uint32_t info = ctx.r5.u32;
-    if (ctx.r3.u32 != 0 || !info)
+    if (!UserSignedIn(ctx.r3.u32) || !info)
     {
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
     }
     memset(GuestPtr(info), 0, 0x28);
-    StoreBE64(info, Xuid());
+    StoreBE64(info, Xuid(ctx.r3.u32));
     StoreBE32(info + 0x0C, 1); // signed in locally
-    strncpy(GuestPtr<char>(info + 0x18), GetSettings().profile.c_str(), 15);
+    strncpy(GuestPtr<char>(info + 0x18), UserName(ctx.r3.u32), 15);
     Return(ctx, X_ERROR_SUCCESS);
 }
 
@@ -295,6 +315,14 @@ GUEST_EXPORT(XamNotifyCreateListener)
 GUEST_EXPORT(XNotifyGetNext)
 {
     // (handle, matchId, id*, param*)
+    // Player 2 coming and going (a second pad, once player 1 is chosen).
+    static std::atomic<uint32_t> signedIn{ 1 };
+    const uint32_t users = PlayerTwoSignedIn() ? 3 : 1;
+    if (signedIn.exchange(users) != users)
+    {
+        Log("users: player 2 signed %s", users == 3 ? "in" : "out");
+        BroadcastNotification(0x0000000A, users); // XN_SYS_SIGNINCHANGED: the signed-in users' bits
+    }
     auto object = GetHandle(ctx.r3.u32);
     if (!object)
     {
@@ -341,7 +369,7 @@ GUEST_EXPORT(XamShowSigninUI)
         if (auto l = weak.lock())
         {
             l->queue.push_back({ 0x00000009, 1 }); // XN_SYS_UI: shown
-            l->queue.push_back({ 0x0000000A, 1 }); // XN_SYS_SIGNINCHANGED: user 0
+            l->queue.push_back({ 0x0000000A, PlayerTwoSignedIn() ? 3u : 1u }); // XN_SYS_SIGNINCHANGED: the signed-in users' bits
             l->queue.push_back({ 0x00000009, 0 }); // XN_SYS_UI: hidden
         }
     Return(ctx, X_ERROR_SUCCESS);
@@ -631,15 +659,22 @@ DWORD PadSlot(uint32_t user)
     return DWORD(slotOf[user < XUSER_MAX_COUNT ? user : 0]);
 }
 
-// Only player 1 is signed in, so a pad in a later position (an idle virtual pad or a second controller ahead of the one
-// in hand) started the game without a profile: new driver, nothing saved. The first pad pressed swaps places with
-// player 1; that press is held back, to reach the game as player 1's. PGR4_NO_LEAD_PAD=1: off.
-std::atomic<int> g_leadPad{ -1 }; // the device playing as player 1; -1 until a pad is pressed
+// The first pad to press A or START on the title screen is player 1, whatever its position (the game's prompt says
+// START, and either goes on); that press is held back, to reach the game as player 1's. The next pad in order is then
+// player 2 (split screen). Reaching the title screen again chooses again. PGR4_NO_LEAD_PAD=1: off, player 1 only.
+std::atomic<int> g_leadPad{ -1 }; // the device playing as player 1; -1 until chosen
+std::atomic<bool> g_titleScreen{ false }; // waiting on the title screen for that press
+std::atomic<bool> g_checkPlayerTwo{ false }; // player 1 was just chosen: is there a second pad?
+std::atomic<bool> g_playerTwo{ false };
+// The game's profile screens wait for their own player's pad, which may be idle or across the room: player 1's input
+// counts for player 2 there.
+std::atomic<bool> g_profileScreens{ false };
 
 uint32_t DeviceOf(uint32_t user)
 {
     const int lead = g_leadPad.load(std::memory_order_relaxed);
-    return lead <= 0 ? user : user == 0 ? uint32_t(lead) : user == uint32_t(lead) ? 0 : user;
+    // Player 1 is the lead; the others keep their order around it.
+    return lead <= 0 ? user : user == 0 ? uint32_t(lead) : user <= uint32_t(lead) ? user - 1 : user;
 }
 
 // Player `user`'s controller: an XInput pad, else a pad XInput doesn't see (DualSense, DualShock 4, Switch Pro and
@@ -677,14 +712,13 @@ bool ReadDevice(uint32_t player, PadState& s)
         return false;
     RemapPad(s);
     static const bool noLead = getenv("PGR4_NO_LEAD_PAD") != nullptr;
-    if (s.buttons && !noLead && g_leadPad.load(std::memory_order_relaxed) < 0)
+    if ((s.buttons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START)) && !noLead && g_titleScreen.exchange(false))
     {
         g_leadPad = int(user);
+        g_checkPlayerTwo = true;
+        Log("input: device %u pressed first on the title screen, now player 1", user);
         if (user != 0)
-        {
-            Log("input: the first pad pressed is device %u, now player 1", user);
             s.buttons = 0;
-        }
     }
     return true;
 }
@@ -776,8 +810,13 @@ bool ReadPad(uint32_t user, PadState& s)
             }
         }
     }
+    // Testing without a second controller: PGR4_TEST_P2 connects a virtual one, and PGR4_TEST_P2_INPUT sends the debug
+    // server's input to it instead of player 1.
+    static LiveSwitch testP2("PGR4_TEST_P2"), testP2Input("PGR4_TEST_P2_INPUT");
+    if (user == 1 && testP2)
+        connected = true;
     // The debug server's input (debug.cpp) on top of everything else.
-    if (regpu::DebugPad d; user == 0 && regpu::DebugPadState(d))
+    if (regpu::DebugPad d; user == (testP2Input ? 1u : 0u) && regpu::DebugPadState(d))
     {
         connected = true;
         s.buttons |= d.buttons;
@@ -786,8 +825,51 @@ bool ReadPad(uint32_t user, PadState& s)
         if (d.sticks)
             s.lx = d.lx, s.ly = d.ly, s.rx = d.rx, s.ry = d.ry;
     }
+    // The keyboard and the debug server play as device 0's player.
+    if (user == 0 && (s.buttons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START)) && g_titleScreen.exchange(false))
+    {
+        g_leadPad = 0;
+        g_checkPlayerTwo = true;
+        Log("input: player 1's keyboard or debug input pressed first on the title screen");
+    }
+    if (user == 1 && g_profileScreens.load(std::memory_order_relaxed))
+    {
+        PadState first;
+        ReadPad(0, first);
+        s.buttons |= first.buttons;
+        if (std::abs(first.lx) > std::abs(s.lx))
+            s.lx = first.lx;
+        if (std::abs(first.ly) > std::abs(s.ly))
+            s.ly = first.ly;
+    }
     return connected;
 }
+}
+
+void TitleScreenReached()
+{
+    static const bool noLead = getenv("PGR4_NO_LEAD_PAD") != nullptr;
+    if (noLead)
+        return;
+    g_leadPad = -1;
+    g_profileScreens = false;
+    g_titleScreen = true;
+    Log("input: title screen, waiting for player 1's press");
+}
+
+void SetProfileScreens(bool on) { g_profileScreens = on; }
+
+// Player 2 is signed in if a second controller is connected when player 1 is chosen, and that stands until player 1 is
+// next chosen: the game answers any profile change by dropping everyone to the title screen and their unsaved
+// progress, so a wireless pad going to sleep must not count as one.
+bool PlayerTwoSignedIn()
+{
+    if (g_checkPlayerTwo.exchange(false))
+    {
+        PadState s;
+        g_playerTwo = ReadPad(1, s);
+    }
+    return g_playerTwo;
 }
 
 GUEST_EXPORT(XamInputGetCapabilities)
@@ -935,7 +1017,8 @@ GUEST_EXPORT(XamContentCreateEx)
     // XCONTENT_DATA: deviceId, contentType, displayName[128] (wide), fileName[42].
     const std::string fileName(GuestPtr<char>(data + 8 + 256), strnlen(GuestPtr<char>(data + 8 + 256), 42));
     const uint32_t contentType = LoadBE32(data + 4);
-    std::filesystem::path dir = ContentTypeDir(contentType) / fileName;
+    const uint32_t user = ctx.r3.u32;
+    std::filesystem::path dir = ContentTypeDir(contentType, user) / fileName;
     std::error_code ec;
     // A downloadable package installed in the shared folder: mounted read-only from there.
     const bool shared = contentType == 2 && std::filesystem::is_directory(DlcDir() / fileName, ec);
@@ -961,10 +1044,10 @@ GUEST_EXPORT(XamContentCreateEx)
                 break;
             title += char16_t(c);
         }
-        std::ofstream(TitlePath(contentType, fileName), std::ios::binary).write(reinterpret_cast<const char*>(title.data()), title.size() * 2);
+        std::ofstream(TitlePath(contentType, fileName, user), std::ios::binary).write(reinterpret_cast<const char*>(title.data()), title.size() * 2);
     }
     const std::string device = shared ? "\\Device\\Dlc\\" + fileName
-                                      : "\\Device\\Content\\" + dir.parent_path().filename().string() + "\\" + fileName;
+                                      : std::string(user == 1 ? "\\Device\\Content2\\" : "\\Device\\Content\\") + dir.parent_path().filename().string() + "\\" + fileName;
     VfsAddLink(root + ":", device);
     Log("content: %s: -> %s", root.c_str(), dir.string().c_str());
     StoreIfNonNull(ctx.r7.u32, existed ? 2 : 1); // XCONTENT_OPENED_EXISTING : XCONTENT_CREATED_NEW
@@ -997,8 +1080,8 @@ GUEST_EXPORT(XamContentDelete)
     if (!fileName.empty())
     {
         const uint32_t type = LoadBE32(data + 4);
-        std::filesystem::remove_all(ContentTypeDir(type) / fileName, ec);
-        std::filesystem::remove(TitlePath(type, fileName), ec);
+        std::filesystem::remove_all(ContentTypeDir(type, ctx.r3.u32) / fileName, ec);
+        std::filesystem::remove(TitlePath(type, fileName, ctx.r3.u32), ec);
         Log("content: deleted %08X/%s", type, fileName.c_str());
     }
     FinishUi(ctx, ctx.r5.u32);
@@ -1009,7 +1092,7 @@ GUEST_EXPORT(XamContentGetCreator)
     // (user, data*, isCreator*, xuid*, overlapped)
     StoreIfNonNull(ctx.r5.u32, 1);
     if (ctx.r6.u32)
-        StoreBE64(ctx.r6.u32, Xuid());
+        StoreBE64(ctx.r6.u32, Xuid(ctx.r3.u32));
     FinishUi(ctx, ctx.r7.u32);
 }
 
@@ -1035,9 +1118,9 @@ GUEST_EXPORT(XamContentCreateEnumerator)
     // (user, deviceId, contentType, flags, itemCount, bufferSize*, handle*): lists the
     // profile's packages of that type (all types for 0).
     auto e = std::make_shared<EnumeratorObject>();
-    const uint32_t wanted = ctx.r5.u32;
+    const uint32_t wanted = ctx.r5.u32, user = ctx.r3.u32;
     std::error_code ec;
-    for (const auto& typeDir : std::filesystem::directory_iterator(ContentDir(), ec))
+    for (const auto& typeDir : std::filesystem::directory_iterator(ContentDirOf(user), ec))
     {
         uint32_t type = 0;
         if (!typeDir.is_directory() || sscanf(typeDir.path().filename().string().c_str(), "%x", &type) != 1 || (wanted && type != wanted))
@@ -1048,7 +1131,7 @@ GUEST_EXPORT(XamContentCreateEnumerator)
             if (!package.is_directory() || fileName.size() > 42)
                 continue;
             ContentItem item{ type, {}, fileName };
-            std::ifstream in(TitlePath(type, fileName), std::ios::binary);
+            std::ifstream in(TitlePath(type, fileName, user), std::ios::binary);
             std::string bytes((std::istreambuf_iterator<char>(in)), {});
             item.displayName.assign(reinterpret_cast<const char16_t*>(bytes.data()), bytes.size() / 2);
             if (item.displayName.empty())

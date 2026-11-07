@@ -200,7 +200,7 @@ bool VfsResolve(std::string guest, fs::path& host, bool* readOnly)
             match("\\device\\harddisk0\\partition0", UserDir() / "hdd", false) ||
             match("\\device\\harddisk0\\cache0", UserDir() / "cache", false) ||
             match("\\device\\harddisk0\\cache1", UserDir() / "cache", false) || match("cache:", UserDir() / "cache", false) ||
-            match("\\device\\content", ContentDir(), false) || match("\\device\\dlc", DlcDir(), true)
+            match("\\device\\content2", ContentDir2(), false) || match("\\device\\content", ContentDir(), false) || match("\\device\\dlc", DlcDir(), true)
             || match("update:", TitleUpdateDir(), true)
             ))
         return false;
