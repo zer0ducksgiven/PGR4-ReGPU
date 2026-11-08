@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <dbghelp.h>
 
 #include "live_switch.h"
@@ -527,6 +528,7 @@ void SpikeDump(double ms)
     }
 }
 
+
 // Sampling profiler (PGR4_SAMPLE_THREAD=<guest thread id>; PGR4_PROFILE is the profile name): every millisecond, read the
 // thread's instruction pointer and count it per function; the top of the table
 // is logged every 5 seconds. Needs the symbols crash.cpp loads.
@@ -550,7 +552,40 @@ void StartThreadProfiler()
             Sleep(1);
             HANDLE handle = nullptr;
             extern HANDLE g_profiledWorker;
-            if (env[0] == 'w')
+            // PGR4_SAMPLE_THREAD=n:<text>: the host thread whose description contains text ("n:replay")
+            static HANDLE named = nullptr;
+            if (env[0] == 'n' && env[1] == ':')
+            {
+                if (!named)
+                {
+                    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                    THREADENTRY32 te{ sizeof(te) };
+                    for (BOOL more = Thread32First(snap, &te); more && !named; more = Thread32Next(snap, &te))
+                    {
+                        if (te.th32OwnerProcessID != GetCurrentProcessId())
+                            continue;
+                        HANDLE t = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                        PWSTR desc = nullptr;
+                        if (t && SUCCEEDED(GetThreadDescription(t, &desc)) && desc)
+                        {
+                            char narrow[256] = {};
+                            WideCharToMultiByte(CP_UTF8, 0, desc, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+                            LocalFree(desc);
+                            if (strstr(narrow, env + 2))
+                            {
+                                named = t;
+                                Log("profile: sampling host thread %lu (%s)", te.th32ThreadID, narrow);
+                                continue;
+                            }
+                        }
+                        if (t)
+                            CloseHandle(t);
+                    }
+                    CloseHandle(snap);
+                }
+                handle = named;
+            }
+            else if (env[0] == 'w')
                 handle = g_profiledWorker;
             else
             {
@@ -624,12 +659,18 @@ void StartThreadProfiler()
                     name = std::string("? ") + (strrchr(path, 92) ? strrchr(path, 92) + 1 : path);
                 // Our own code without symbols (dbghelp on the machine can't read the pdb): its address in
                 // the image, written to out/profile_rva.txt for tools to name against the pdb elsewhere.
+                const DWORD64 base = reinterpret_cast<DWORD64>(GetModuleHandleA(nullptr));
+                auto rva = [&](DWORD64 a) { return a > base && a - base < 0x10000000 ? uint32_t(a - base) : 0u; };
                 if (name != "?" && module == GetModuleHandleA(nullptr) && name.rfind("? ", 0) == 0)
-                {
-                    const DWORD64 base = reinterpret_cast<DWORD64>(module);
-                    auto rva = [&](DWORD64 a) { return a > base && a - base < 0x10000000 ? uint32_t(a - base) : 0u; };
                     rvas[{ rva(c.Rip), rva(up[0]), rva(up[1]) }]++;
-                }
+                else
+                    // Outside our code (a wait, the driver): the first two of our callers, under address 0.
+                    for (int k = 0; k + 1 < 6; k++)
+                        if (rva(up[k]))
+                        {
+                            rvas[{ 0u, rva(up[k]), rva(up[k + 1]) }]++;
+                            break;
+                        }
             }
             for (DWORD64 addr : up)
             {
