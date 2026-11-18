@@ -4,6 +4,11 @@
 
 struct PPCContext;
 
+// mftb: the console's 49.875 MHz timebase since the process started (src/kernel/runtime.cpp). ReXenon
+// emits PPC_MFTB(); its default is the host's raw counter.
+uint64_t GuestTimebase();
+#define PPC_MFTB() GuestTimebase()
+
 // MSR[EE] cleared -> take the global interrupt lock; set -> release it.
 void PPCMsrChanged(PPCContext& ctx, uint64_t oldMsr);
 #define PPC_MSR_CHANGED(ctx, oldMsr)                       \

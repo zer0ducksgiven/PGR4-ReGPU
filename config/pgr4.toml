@@ -1,4 +1,4 @@
-# XenonRecomp config for Project Gotham Racing 4 (4D5307F9), default.xex with Title Update #2.
+# ReXenon (XenonRecomp) config for Project Gotham Racing 4 (4D5307F9), default.xex with Title Update #2.
 # Paths are relative to this file.
 [main]
 file_path = "../game/default.xex"

@@ -3,8 +3,8 @@
 A native PC port of **Project Gotham Racing 4** (Bizarre Creations, 2007, Xbox 360). It is not an
 emulator: nothing interprets the console's code or runs it in a virtual machine.
 
-- **The game code is native x64.** [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) translates
-  the game's PowerPC code ahead of time into C++, which is compiled into `pgr4.exe`. The console's
+- **The game code is native x64.** [ReXenon](https://github.com/zer0ducksgiven/ReXenon) (our fork of
+  XenonRecomp) translates the game's PowerPC code ahead of time into C++, which is compiled into `pgr4.exe`. The console's
   kernel and system calls are reimplemented as ordinary Windows code.
 - **The graphics are native Direct3D 12.** **ReGPU**, the renderer in `thirdparty/ReGPU`, turns the
   game's GPU commands into Direct3D 12 draws, and its shaders (Xenos microcode) into HLSL compiled for
@@ -37,7 +37,7 @@ it.
 |---|---|
 | `src/` | The port's runtime: the console kernel and XAM, memory, threads, file system, audio (XMA, WMA via XMP), saves and profiles, settings, and the game-specific hooks (`src/hooks/`) |
 | `thirdparty/ReGPU/` | The renderer: command processor, Xenos shader microcode to HLSL, EDRAM, resolves, MSAA, texture formats, upscaling (FSR 1) and the debug server. Was a submodule of `zer0ducksgiven/ReGPU`; it now lives in this repository |
-| `config/pgr4.toml` | XenonRecomp's function boundaries and jump tables for `default.xex` with Title Update #2 |
+| `config/pgr4.toml` | ReXenon's function boundaries and jump tables for `default.xex` with Title Update #2 |
 | `tools/` | Disc and package extraction (`xiso.py`, `stfs.py`), recompile (`recomp.sh`), import and stub generators |
 | `launcher/PGR4Launcher/` | The launcher (C#, Photino): install, graphics settings, DLC and mods, profiles and 360 save import, title update import, photos, updates |
 | `installer/` | The Inno Setup installer and first-boot setup |
@@ -50,7 +50,7 @@ launcher.
 ```sh
 py -3 tools/xiso.py extract "<PGR4 disc>.iso" game
 py -3 tools/stfs.py update "<TU_16L61VP_...>" out/tu2
-sh tools/recomp.sh                 # applies patches/xenonrecomp.patch; XenonRecomp: game/default.xex + TU2 -> out/ppc
+sh tools/recomp.sh                 # ReXenon: game/default.xex + TU2 -> out/ppc
 cmake --build build/rel            # pgr4.exe
 dotnet build launcher/PGR4Launcher -c Release
 ```
@@ -78,7 +78,8 @@ ReGPU contributors:
 
 ## Credits
 
-- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) (MIT).
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) (MIT), through our fork
+  [ReXenon](https://github.com/zer0ducksgiven/ReXenon).
 - [Xenia](https://github.com/xenia-project/xenia)'s research into the Xenos GPU and the Xbox 360
   kernel informed this work. No Xenia code is included.
 - AMD FidelityFX SDK (MIT); Microsoft's `d3dcompiler_47.dll` (Windows SDK redistributable);

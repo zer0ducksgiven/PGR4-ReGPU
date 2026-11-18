@@ -8,7 +8,7 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "pgr4 needs clang-cl (the recompiled code uses clang builtins)")
 endif()
 
-add_subdirectory(thirdparty/XenonRecomp EXCLUDE_FROM_ALL)
+add_subdirectory(thirdparty/ReXenon EXCLUDE_FROM_ALL)
 
 # Recompiled game code (out/ppc: tools/recomp.sh from your own disc and title update; never committed).
 set(PGR4_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
@@ -17,20 +17,13 @@ if(NOT PGR4_PPC_SOURCES)
     message(FATAL_ERROR "out/ppc is empty: run tools/recomp.sh first")
 endif()
 add_library(pgr4_ppc STATIC ${PGR4_PPC_SOURCES})
-target_include_directories(pgr4_ppc PUBLIC "${PGR4_PPC_DIR}" thirdparty/XenonRecomp/thirdparty/simde)
+target_include_directories(pgr4_ppc PUBLIC "${PGR4_PPC_DIR}" thirdparty/ReXenon/thirdparty/simde)
 target_compile_options(pgr4_ppc PRIVATE -Wno-everything)
 target_compile_options(pgr4_ppc PUBLIC -msse4.1 -fno-strict-aliasing)
 # Function names in crash reports and profiles.
 target_compile_options(pgr4_ppc PRIVATE -gline-tables-only "/FI${CMAKE_SOURCE_DIR}/src/ppc_hooks.h")
 
-# The recompiled code reads the host's raw timestamp counter for mftb; give it the console's
-# timebase instead (tools/patch_mftb.py, GuestTimebase in src/kernel/runtime.cpp).
-execute_process(COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/patch_mftb.py" "${PGR4_PPC_DIR}"
-                OUTPUT_VARIABLE PGR4_MFTB_RESULT RESULT_VARIABLE PGR4_MFTB_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(NOT PGR4_MFTB_CODE EQUAL 0)
-    message(FATAL_ERROR "tools/patch_mftb.py failed on ${PGR4_PPC_DIR}")
-endif()
-message(STATUS "mftb: ${PGR4_MFTB_RESULT}")
+# mftb reads the console's timebase: ReXenon emits PPC_MFTB(), which src/ppc_hooks.h maps to GuestTimebase().
 
 # Local SDKs, not committed: the AMD FidelityFX SDK (MIT; ReGPU builds FSR 1's shaders from its headers)
 # and a shared LGPL FFmpeg build (XMA audio). Defaults are under thirdparty/.
@@ -41,7 +34,7 @@ if(NOT EXISTS "${PGR4_FFMPEG}/include/libavcodec/avcodec.h")
 endif()
 
 # ReGPU: the GPU.
-set(REGPU_XENONRECOMP "${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp" CACHE PATH "" FORCE)
+set(REGPU_XENONRECOMP "${CMAKE_SOURCE_DIR}/thirdparty/ReXenon" CACHE PATH "" FORCE)
 set(REGPU_PPC_DIR "${PGR4_PPC_DIR}" CACHE PATH "" FORCE)
 set(REGPU_FFX "${PGR4_FFX}" CACHE PATH "" FORCE)
 add_subdirectory(thirdparty/ReGPU)
