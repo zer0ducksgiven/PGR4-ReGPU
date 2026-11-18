@@ -2131,6 +2131,20 @@ void Init()
 double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resources)
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
+// Asynchronous frame end (from FM3-ReGPU via FM2): the frame's list is closed and submitted, and the present and
+// fence queued, on the command-list replay thread, so the command processor (or draw thread) no longer waits for
+// the replay at every swap. g_asyncFrameEnded: the next frame starts in a pool list (BeginFrameIfNeeded).
+// g_asyncEndPending: queued and not yet run; other submissions wait for it first (FlushAsyncFrameEnd), so the
+// queue order and the fence values stay as they were. REGPU_SYNC_PRESENT=1 (live): the old frame end.
+bool g_asyncFrameEnded = false;
+std::atomic<bool> g_asyncEndPending{ false };
+thread_local bool t_inAsyncEnd = false;
+ID3D12GraphicsCommandList* AcquireList();
+void FlushAsyncFrameEnd()
+{
+    if (!t_inAsyncEnd && g_asyncEndPending.load(std::memory_order_acquire))
+        g_r.recorder.Real();
+}
 
 // A new output resolution (regpu::SetOutputSize), taken at the start of a frame with the host GPU idle:
 // the EDRAM surfaces (made at the output size on first use) are dropped and come back at the new size,
@@ -2699,10 +2713,20 @@ void BeginFrameIfNeeded()
         }
         f.timed = false;
     }
-    f.allocator->Reset();
     f.poolUsed = 0;
-    g_r.recorder.Rebind(g_r.realList.Get()); // (a pool list may have continued last frame)
-    C().list->Reset(f.allocator.Get(), nullptr);
+    if (g_asyncFrameEnded)
+    {
+        // The last frame ended on the replay thread, which closes its list: this one records into a pool
+        // list of its own slot, without waiting for that (Rebind would).
+        g_asyncFrameEnded = false;
+        g_r.recorder.Switch(AcquireList());
+    }
+    else
+    {
+        f.allocator->Reset();
+        g_r.recorder.Rebind(g_r.realList.Get()); // (a pool list may have continued last frame)
+        C().list->Reset(f.allocator.Get(), nullptr);
+    }
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
@@ -8430,6 +8454,7 @@ std::vector<ID3D12CommandList*> g_pendingLists;
 // Submits the queued lists, then these.
 void SubmitLists(UINT n, ID3D12CommandList* const* lists)
 {
+    FlushAsyncFrameEnd();
     std::lock_guard lock(g_pendingMutex);
     g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
     if (!g_pendingLists.empty())
@@ -8443,6 +8468,7 @@ void QueueLists(UINT n, ID3D12CommandList* const* lists)
     static const bool now = getenv("REGPU_NO_DEFER_LISTS") != nullptr;
     if (now)
         return SubmitLists(n, lists);
+    FlushAsyncFrameEnd();
     std::lock_guard lock(g_pendingMutex);
     g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
 }
@@ -11888,7 +11914,21 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
         if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
             shown = enhanced;
-    const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
+    static LiveSwitch syncPresent("REGPU_SYNC_PRESENT");
+    const bool asyncEnd = !syncPresent;
+    struct AsyncEnd
+    {
+        bool copy = false;
+        ID3D12Resource *shown = nullptr, *overlay = nullptr;
+        UINT64 fence = 0;
+    };
+    static AsyncEnd asyncEnds[kFrames];
+    AsyncEnd& end = asyncEnds[g_r.frameIndex];
+    bool presenting = false;
+    if (asyncEnd)
+        end = { fromResolve, shown, overlay, 0 };
+    else
+        presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
     {
         const uint64_t traceFrame = TraceFrame();
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -12062,13 +12102,39 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         const UINT first = g_r.frameIndex * kOcclusionPerFrame;
         C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, first, g_occlusionCount, g_occlusionReadback.Get(), UINT64(first) * 8);
     }
-    C().list->Close();
-    ID3D12CommandList* lists[] = { C().list->Real() };
-    SubmitLists(1, lists);
-    if (presenting)
-        PresenterPresentAsync(); // on the presenter's thread: Present was 4-5% of FM2's command processor
-    Frame().fence = g_r.nextFence++;
-    g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
+    if (asyncEnd)
+    {
+        // The fence value is taken here, in order with the other signals (which flush this first).
+        Frame().fence = g_r.nextFence++;
+        end.fence = Frame().fence;
+        g_asyncEndPending.store(true, std::memory_order_release);
+        C().list->Call(
+            [](ID3D12GraphicsCommandList* l, void* ctx) {
+                const AsyncEnd& e = *static_cast<const AsyncEnd*>(ctx);
+                t_inAsyncEnd = true;
+                const bool show = e.copy && PresenterRecordCopy(l, e.shown, e.overlay, kOverlayW, kOverlayH);
+                l->Close();
+                ID3D12CommandList* lists[] = { l };
+                SubmitLists(1, lists);
+                if (show)
+                    PresenterPresentAsync();
+                g_r.queue->Signal(g_r.fence.Get(), e.fence);
+                t_inAsyncEnd = false;
+                g_asyncEndPending.store(false, std::memory_order_release);
+            },
+            &end);
+        g_asyncFrameEnded = true;
+    }
+    else
+    {
+        C().list->Close();
+        ID3D12CommandList* lists[] = { C().list->Real() };
+        SubmitLists(1, lists);
+        if (presenting)
+            PresenterPresentAsync(); // on the presenter's thread: Present was 4-5% of FM2's command processor
+        Frame().fence = g_r.nextFence++;
+        g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
+    }
     overwrite::EndFrame(g_r.frameIndex, Frame().fence, g_r.frame);
     g_r.listOpen = false;
 

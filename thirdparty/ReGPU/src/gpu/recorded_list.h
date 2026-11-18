@@ -50,6 +50,8 @@ inline void (*g_barrierSites)(void* caller, UINT n, const D3D12_RESOURCE_BARRIER
 class RecordedList
 {
 public:
+    using CallFn = void (*)(ID3D12GraphicsCommandList* real, void* ctx);
+
     // direct: call the list right away (draw workers, which run in parallel themselves).
     void Init(ID3D12GraphicsCommandList* real, bool direct = false)
     {
@@ -164,6 +166,19 @@ public:
         struct A { ID3D12Device* d; ID3D12Resource* r; D3D12_DEPTH_STENCIL_VIEW_DESC desc; D3D12_CPU_DESCRIPTOR_HANDLE h; } a{ d, r, desc, h };
         Put(kCreateDsv, &a, sizeof(a));
     }
+    // fn(real list, ctx) runs on the replay thread when the replay reaches this point (the asynchronous
+    // frame end: it closes and submits the list there). If fn closes the list, Switch must follow before
+    // anything else is recorded.
+    void Call(CallFn fn, void* ctx)
+    {
+        struct A { CallFn fn; void* ctx; } a{ fn, ctx };
+        Put(kCall, &a, sizeof(a));
+        Submit();
+    }
+
+    // Records into another list from here on, without waiting for the replay (Rebind waits).
+    void Switch(ID3D12GraphicsCommandList* next) { Put(kSwitch, &next, sizeof(next)); }
+
     // Close and Reset go straight to the real list after a drain.
     HRESULT Close() { return Real()->Close(); }
     HRESULT Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) { return Real()->Reset(a, p); }
@@ -173,7 +188,7 @@ private:
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
-        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff, kCall, kSwitch
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -326,6 +341,14 @@ private:
             case kBlendFactor: l->OMSetBlendFactor(reinterpret_cast<const FLOAT*>(a)); break;
             case kTopology: l->IASetPrimitiveTopology(At<D3D12_PRIMITIVE_TOPOLOGY>(a)); break;
             case kHeaps: l->SetDescriptorHeaps(At<UINT>(a), reinterpret_cast<ID3D12DescriptorHeap* const*>(a + sizeof(UINT))); break;
+            case kCall:
+            {
+                struct A { CallFn fn; void* ctx; };
+                const A h = At<A>(a);
+                h.fn(l, h.ctx);
+                break;
+            }
+            case kSwitch: l = m_real = At<ID3D12GraphicsCommandList*>(a); break;
             case kDraw:
             {
                 const UINT* d = reinterpret_cast<const UINT*>(a);
