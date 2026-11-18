@@ -1116,6 +1116,7 @@ struct Emitter
             case CfOp::CondExecPredCleanEnd:
             {
                 char cond[96];
+                result.readsBools = true;
                 snprintf(cond, sizeof(cond), "if (BoolConstant(%s, %u) == %s)", pixel ? "pb" : "vb", (cf.hi >> 2) & 0xFF,
                     cf.condition() ? "true" : "false");
                 Line(std::string(cond) + " {");
@@ -1142,8 +1143,11 @@ struct Emitter
                 else if ((cf.lo >> 14) & 1)
                     cond = cf.condition() ? "p" : "!p";
                 else
+                {
+                    result.readsBools = true;
                     cond = std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string((cf.hi >> 2) & 0xFF) + ") == " +
                         (cf.condition() ? "true" : "false");
+                }
                 Line("cfpc = (" + cond + ") ? " + std::to_string(target) + "u : " + next + "u;");
                 if (!forward)
                     Line("continue;");
@@ -1156,6 +1160,7 @@ struct Emitter
             case CfOp::LoopStart:
             {
                 const uint32_t target = cf.lo & 0x1FFF, id = (cf.lo >> 16) & 0x1F;
+                result.readsLoops = true;
                 const std::string k = std::string(pixel ? "pl" : "vl") + "[" + std::to_string(id >> 2) + "][" + std::to_string(id & 3) + "]";
                 Line("{ uint lk = " + k + "; uint d = min(loopDepth, 3u); loopSaved[d] = aL; loopCount[d] = lk & 0xFFu;");
                 if (!((cf.lo >> 13) & 1))
@@ -1167,6 +1172,7 @@ struct Emitter
             case CfOp::LoopEnd:
             {
                 const uint32_t target = cf.lo & 0x1FFF, id = (cf.lo >> 16) & 0x1F;
+                result.readsLoops = true;
                 const std::string k = std::string(pixel ? "pl" : "vl") + "[" + std::to_string(id >> 2) + "][" + std::to_string(id & 3) + "]";
                 std::string brk = "false";
                 if ((cf.lo >> 21) & 1)
@@ -1186,8 +1192,11 @@ struct Emitter
                 else if ((cf.lo >> 14) & 1)
                     cond = cf.condition() ? "p" : "!p";
                 else
+                {
+                    result.readsBools = true;
                     cond = std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string((cf.hi >> 2) & 0xFF) + ") == " +
                         (cf.condition() ? "true" : "false");
+                }
                 Line("if ((" + cond + ") && callDepth < 4) { callRet[callDepth++] = " + std::to_string(i + 1) + "u; cfpc = " +
                     std::to_string(target) + "u; continue; }");
                 break;

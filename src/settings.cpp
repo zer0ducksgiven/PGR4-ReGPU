@@ -74,6 +74,8 @@ void Load()
             g_settings.msaa = uint32_t(atoi(value.c_str()));
         else if (key == "low_performance")
             g_settings.lowPerformance = value == "1";
+        else if (key == "thread_pinning")
+            g_settings.threadPinning = value != "0";
         else if (key == "upscaler")
             g_settings.upscaler = ParseUpscaler(value);
         else if (key == "upscale_quality")
@@ -209,6 +211,7 @@ void SaveSettings()
     out << "language=" << s.language << "\n";
     out << "msaa=" << s.msaa << "\n";
     out << "low_performance=" << (s.lowPerformance ? 1 : 0) << "\n";
+    out << "thread_pinning=" << (s.threadPinning ? 1 : 0) << "\n";
     out << "upscaler=" << UpscalerName(s.upscaler) << "\n";
     out << "upscale_quality=" << s.quality << "\n";
     out << "sharpness=" << s.sharpness << "\n";

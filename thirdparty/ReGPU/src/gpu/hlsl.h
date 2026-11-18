@@ -49,6 +49,10 @@ struct TranslatedShader
     // The same as a bit per constant (all of them with relative addressing): a draw copies only
     // these (shaders read a few constants spread up to c[255]: ~440 per draw were copied).
     std::array<uint64_t, 4> constantMask{};
+    // The code reads bool constants (vb/pb) / loop constants (vl/pl): a draw uploads only what its
+    // shaders read (most read no bools, loops almost never).
+    bool readsBools = false;
+    bool readsLoops = false;
     // Vertex shaders: bit per interpolator (o0-o15) the code exports.
     uint32_t interpolatorsWritten = 0;
 };

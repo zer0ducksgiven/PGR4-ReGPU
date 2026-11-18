@@ -35,6 +35,10 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+// getenv is a linear, case-insensitive search of the environment, and debugging switches are read with it on
+// every draw: on an RTX 5090 a 1080p race went from 70 to 162 fps with the lookups cached (fast_env.h).
+#include "fast_env.h"
+#define getenv(name) FastEnv(name)
 #include "gpu/hlsl.h"
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
@@ -341,6 +345,7 @@ struct CompiledShader
     TranslatedShader info;
     const CompiledShader* hlslSource = nullptr; // canonical variants: the shader whose code (and HLSL) this reuses
     mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
+    mutable const CompiledShader* noKill = nullptr; // pixel shaders: the variant without the alpha test (NoKillVariantOf)
     uint32_t tag = 0; // the game's mark for this shader (Host::rewriteShader), passed to Host::onDraw
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
@@ -419,6 +424,12 @@ struct FrameResources
     uint8_t* ringCpu = nullptr;
     UINT64 ringSize = 0; // this slot's ring (grows, see RingAlloc)
     std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
+    // REGPU_GPU_UPLOAD_RING (live, from FM3-ReGPU via FM2): the same ring in a GPU upload heap (VRAM the CPU writes
+    // through resizable BAR), swapped with `ring` at the frame start; made only when the device reports GPU upload heaps.
+    ComPtr<ID3D12Resource> ringAlt;
+    uint8_t* ringAltCpu = nullptr;
+    UINT64 ringAltSize = 0;
+    bool ringInVram = false;
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
     std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
     UINT descriptorBase = 0;
@@ -686,6 +697,18 @@ std::mutex g_surfaceMutex;           // EDRAM surfaces
 // before the segment's draws (another worker's earlier draws may use the same texture).
 RecordedList* g_prepList = nullptr;
 
+// The microcode of shaders a context loaded lately, per stage, by hash (direct-mapped). Titles switch
+// between a few shaders from draw to draw: going back to one is a pointer change, not a copy.
+struct ShaderCodeCache
+{
+    struct Slot
+    {
+        uint64_t hash = 0;
+        std::vector<uint32_t> code;
+    } slots[2][128];
+};
+const std::vector<uint32_t> g_noShaderCode;
+
 // What a thread recording draws keeps for itself: its command list, the bound surfaces and
 // shaders. The command processor thread uses the main context (the frame's list); draw
 // workers each have their own (see the parallel draw segments in gpu.cpp).
@@ -697,8 +720,10 @@ struct DrawContext
     // The bound surfaces.
     ComPtr<ID3D12Resource> color, depth;
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    // Active shaders: the last microcode loaded per stage.
-    std::vector<uint32_t> vsCode, psCode;
+    // Active shaders: the last microcode loaded per stage (a slot of codeCache once one is loaded).
+    const std::vector<uint32_t>* vsCode = &g_noShaderCode;
+    const std::vector<uint32_t>* psCode = &g_noShaderCode;
+    std::unique_ptr<ShaderCodeCache> codeCache;
     uint64_t vsHash = 0, psHash = 0;
     bool worker = false; // a draw worker: frame-level work (begin, resolves, swaps) is not its job
     uint32_t draws = 0;  // a worker's draws, added to drawsThisFrame once at the end of its piece
@@ -706,6 +731,21 @@ struct DrawContext
 DrawContext g_mainContext;
 thread_local DrawContext* t_context = nullptr;
 inline DrawContext& C() { return t_context ? *t_context : g_mainContext; }
+// Locked ops on the draw path: each also drains the write-combined ring writes before it, so they are skipped
+// where they can't matter: counters and the dynamic-buffer lock off the draw pieces (pieces run only inside
+// RendererRunPieces, which waits for them all, so a non-worker context is alone), the shader-edit lock until
+// an edit is made. =1: the old way (A/B).
+LiveSwitch g_sw_REGPU_PS_EDIT_LOCK("REGPU_PS_EDIT_LOCK");
+LiveSwitch g_sw_REGPU_LOCKED_COUNTERS("REGPU_LOCKED_COUNTERS");
+LiveSwitch g_sw_REGPU_DYNAMIC_LOCK("REGPU_DYNAMIC_LOCK");
+// A per-frame counter: only piece workers add to one at once, so elsewhere a plain add does.
+template <class T> inline void Bump(std::atomic<T>& v)
+{
+    if (C().worker || g_sw_REGPU_LOCKED_COUNTERS)
+        v.fetch_add(1, std::memory_order_relaxed);
+    else
+        v.store(v.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
 
 // Holds the texture lock and, on a draw worker, records into the segment's prep list.
 struct TextureScope
@@ -1003,6 +1043,8 @@ struct SlotBinding
     uint32_t tinfo[4] = {};
     float tbias[4] = {};
     bool samplesResolve = false;
+    bool resolveFree = false; // a plain 2D texture, not a resolve: still good after a resolve elsewhere (see the slot loop)
+    float lodShift = 0.0f;    // the LOD bias added for the scene scale when it was made
 };
 // A cache valid for one frame: an open-addressed table whose slots carry the frame they were filled
 // in; a slot of another frame is empty, so a new frame starts with an empty table without clearing
@@ -1461,6 +1503,33 @@ D3D12_GPU_DESCRIPTOR_HANDLE Gpu(ID3D12DescriptorHeap* heap, UINT index, UINT str
     D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
     h.ptr += UINT64(index) * stride;
     return h;
+}
+
+bool g_gpuUploadHeap = false; // GPU upload heaps reported and allowed (see the ring set-up)
+
+// An upload ring in a GPU upload heap, mapped (write-combined VRAM: the CPU only writes it); null if refused.
+ComPtr<ID3D12Resource> CreateGpuUploadRing(UINT64 size, uint8_t*& cpu)
+{
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> r;
+    const HRESULT hr = g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+    if (FAILED(hr) || FAILED(r->Map(0, nullptr, reinterpret_cast<void**>(&cpu))))
+    {
+        Log("renderer: GPU upload heap ring of %llu MB failed (0x%08X): ring stays in system memory", (unsigned long long)(size >> 20), unsigned(hr));
+        cpu = nullptr;
+        return nullptr;
+    }
+    CountCreate("buffer");
+    return r;
 }
 
 ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state)
@@ -2024,6 +2093,17 @@ void Init()
         // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
         : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
     Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
+    // GPU upload heaps (OPTIONS16; true only with resizable BAR / Smart Access Memory on): the upload ring can live
+    // in VRAM. A second ring per frame slot is made there for the live switch REGPU_GPU_UPLOAD_RING (off by
+    // default; FM2's 4070: +6.5% at 1440p, -9% at 720p). REGPU_NO_GPU_UPLOAD_RING=1: not made.
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
+        const bool queried = SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof(o16)));
+        g_gpuUploadHeap = queried && o16.GPUUploadHeapSupported;
+        Log("renderer: GPU upload heaps %s", !queried ? "unknown (OPTIONS16 not reported)" : g_gpuUploadHeap ? "supported (resizable BAR on)" : "not supported");
+        if (getenv("REGPU_NO_GPU_UPLOAD_RING"))
+            g_gpuUploadHeap = false;
+    }
     for (UINT i = 0; i < kFrames; i++)
     {
         FrameResources& f = g_r.frames[i];
@@ -2031,6 +2111,9 @@ void Init()
         f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.ringSize = kRingSize;
+        if (g_gpuUploadHeap && !(f.ringAlt = CreateGpuUploadRing(kRingSize, f.ringAltCpu)))
+            g_gpuUploadHeap = false;
+        f.ringAltSize = f.ringAlt ? kRingSize : 0;
         f.descriptorBase = i * kDescriptorsPerFrame;
     }
     Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
@@ -2259,6 +2342,13 @@ void SelectSurfaces(bool force)
 UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind);
 // The per-draw functions' switches, at namespace scope: as function-local statics each one checked
 // its initialisation guard on every draw (dozens a draw).
+LiveSwitch g_sw_REGPU_ALL_BOOL_LOOP("REGPU_ALL_BOOL_LOOP");
+// Below the output resolution (a temporal upscaler's scene): mips biased sharper by log2 of the scale (see the slot loop).
+inline float LodShift()
+{
+    static LiveSwitch noLodBias("REGPU_NO_LOD_BIAS");
+    return g_sceneScale < 1.0f && !noLodBias ? std::log2(g_sceneScale) : 0.0f;
+}
 LiveSwitch g_sw_REGPU_ALL_CONSTANTS("REGPU_ALL_CONSTANTS");
 LiveSwitch g_sw_REGPU_ASYNC_SHADERS("REGPU_ASYNC_SHADERS");
 LiveSwitch g_sw_REGPU_CONSTANTS_BY_COUNT("REGPU_CONSTANTS_BY_COUNT");
@@ -2635,11 +2725,31 @@ void BeginFrameIfNeeded()
         if (used > f.ringSize / 2)
             Log("renderer: upload ring peak %llu MB of %llu", (unsigned long long)(used >> 20), (unsigned long long)(f.ringSize >> 20));
     }
+    // REGPU_GPU_UPLOAD_RING: this slot's ring in VRAM or system memory (its last use finished with its frame).
+    if (static LiveSwitch vramRing("REGPU_GPU_UPLOAD_RING"); f.ringAlt && bool(vramRing) != f.ringInVram)
+    {
+        std::swap(f.ring, f.ringAlt);
+        std::swap(f.ringCpu, f.ringAltCpu);
+        std::swap(f.ringSize, f.ringAltSize);
+        f.ringInVram = !f.ringInVram;
+        if (frameIndex == 0)
+            Log("renderer: upload ring in %s", f.ringInVram ? "VRAM (GPU upload heap)" : "system memory");
+    }
     if (const UINT64 want = g_ringWant.load(); want > f.ringSize)
     {
         f.garbage.push_back(f.ring); // the old ring may still be referenced by views until this frame's end
-        f.ring = CreateBuffer(want, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+        uint8_t* cpu = nullptr;
+        ComPtr<ID3D12Resource> vram = f.ringInVram ? CreateGpuUploadRing(want, cpu) : nullptr;
+        if (vram)
+        {
+            f.ring = vram;
+            f.ringCpu = cpu;
+        }
+        else
+        {
+            f.ring = CreateBuffer(want, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+        }
         f.ringSize = want;
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
@@ -2749,7 +2859,10 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
         return *a;
     static std::unordered_map<uint64_t, Seen> seen;
     static std::mutex mutex; // the draw workers (REGPU_DRAW_WORKERS) check buffers too
-    std::lock_guard lock(mutex);
+    // Only draw pieces get here at once: the command processor thread on its own takes no lock.
+    std::unique_lock lock(mutex, std::defer_lock);
+    if (C().worker || g_sw_REGPU_DYNAMIC_LOCK)
+        lock.lock();
     Seen& s = seen[key];
     // Hashing is the cost: a buffer that stopped changing (static geometry, most of them) is
     // checked every 16th frame, one that changes every frame.
@@ -3656,6 +3769,17 @@ struct ShaderCompiler
         cv.notify_one();
     }
 
+    // Background, never parked: a variant a draw will ask for again (no pop-up while it compiles).
+    void PushQuiet(CompiledShader* cs)
+    {
+        {
+            std::lock_guard lock(mutex);
+            waiting++;
+            background.push_back(cs);
+        }
+        cv.notify_one();
+    }
+
     // Moves a background shader something now needs to the front of the urgent queue.
     void Promote(const CompiledShader& cs)
     {
@@ -3779,12 +3903,17 @@ std::unordered_map<uint64_t, uint64_t> g_psEditAlias; // shader -> alias
 std::unordered_map<uint64_t, std::string> g_psEditExpr; // alias -> the expression it returns
 std::atomic<bool> g_psEdits{ false };
 std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
+std::atomic<bool> g_psEditMade{ false }; // set (under g_psEditMutex) with the first alias, never cleared
 // The debug server's drawstats: draws per (vs, ps) over one frame.
 std::atomic<int> g_drawStats{ 0 }; // 1 armed for the next frame, 2 counting, 0 off
 std::mutex g_drawStatsMutex;
 std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_drawStatsCounts;
 bool IsPsEditAlias(uint64_t hash)
 {
+    // Asked several times a draw and edits are rare: no lock until one is made. A draw only holds an alias
+    // from PsEditAlias, which took the mutex the flag was set under, so it sees the flag.
+    if (!g_psEditMade.load(std::memory_order_relaxed) && !g_sw_REGPU_PS_EDIT_LOCK)
+        return false;
     std::lock_guard lock(g_psEditMutex);
     return g_psEditEver.count(hash) != 0;
 }
@@ -3799,18 +3928,19 @@ uint64_t PsEditAlias(uint64_t hash)
 
 const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background);
 // Shaders are never removed: each thread remembers the ones it looked up (no lock per draw).
+// Neighbouring draws mostly use the same shaders: a small direct-mapped table in front of each thread's
+// map (its lookups were ~0.7% of the command processor). Shaders are never removed: an entry never goes stale.
+struct RecentShader
+{
+    uint64_t hash = 0;
+    const CompiledShader* cs = nullptr;
+};
+thread_local RecentShader t_recentShaders[64];
+inline RecentShader& RecentShaderSlot(uint64_t hash) { return t_recentShaders[(hash ^ (hash >> 17)) & 63]; }
 const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
 {
     thread_local std::unordered_map<uint64_t, const CompiledShader*> known;
-    // Neighbouring draws mostly use the same shaders: a small direct-mapped table in front of the map
-    // (its lookups were ~0.7% of the command processor).
-    struct Recent
-    {
-        uint64_t hash = 0;
-        const CompiledShader* cs = nullptr;
-    };
-    thread_local Recent recent[64];
-    Recent& r = recent[(hash ^ (hash >> 17)) & 63];
+    RecentShader& r = RecentShaderSlot(hash);
     const CompiledShader* found = r.hash == hash ? r.cs : nullptr;
     if (!found)
         if (auto it = known.find(hash); it != known.end())
@@ -3829,6 +3959,17 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     known.emplace(hash, &cs);
     r = { hash, &cs };
     return cs;
+}
+
+// In g_r.shaders? One this thread has looked up is there for good (GetShaderLocked only adds), so the
+// draw's "unseen shader" check skips the map for those. REGPU_SHADER_MAP_ONLY=1: the map every time (A/B).
+LiveSwitch g_sw_REGPU_SHADER_MAP_ONLY("REGPU_SHADER_MAP_ONLY");
+bool ShaderInMap(uint64_t hash)
+{
+    const RecentShader& hot = RecentShaderSlot(hash);
+    if (hot.cs && hot.hash == hash && !g_sw_REGPU_SHADER_MAP_ONLY)
+        return true;
+    return g_r.shaders.find(hash) != g_r.shaders.end();
 }
 
 const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background)
@@ -3885,6 +4026,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.constantMask = base.info.constantMask;
                 cs.info.interpolatorsWritten = base.info.interpolatorsWritten;
+                cs.info.readsBools = base.info.readsBools; // same control flow
+                cs.info.readsLoops = base.info.readsLoops;
                 cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
@@ -4041,6 +4184,11 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             Log("debug: ps alias %016llx returns %s", (unsigned long long)hash, expr.c_str());
         }
     }
+    // The debug edits above and the host's shader rewrite can read any constant: give those shaders the
+    // bool and loop constants.
+    if (regpu::GetHost().rewriteShader || getenv("REGPU_DEBUG_VS") || getenv("REGPU_DEBUG_PS") || getenv("REGPU_DEBUG_PS_ALL") ||
+        g_psEdits.load(std::memory_order_relaxed))
+        cs.info.readsBools = cs.info.readsLoops = true;
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
     if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
     {
@@ -4182,6 +4330,74 @@ const CompiledShader* MotionShaderLookup(const CompiledShader& base)
     }
     g_compiler.Push(&cs, false);
     return &cs;
+}
+
+// REGPU_SPLIT_ALPHA_TEST (from FM3-ReGPU via FM2; REGPU_NO_SPLIT_ALPHA_TEST=1 live = off): draws with the alpha test off use a
+// variant of their pixel shader without the run-time alpha test (the `switch (pinfo.x)` ending in `discard`). A
+// shader that may discard can lose early depth rejection on PC GPUs, so hidden pixels run the whole shader; Xenos
+// tests alpha in fixed function after the shader. The guest's own kill instructions stay in both. Key flag 8.
+std::string NoKillVariant(const std::string& hlsl)
+{
+    const std::string start = "    switch (pinfo.x)\n    {\n", end = "    }\n";
+    const size_t a = hlsl.find(start);
+    if (a == std::string::npos || hlsl.find(start, a + 1) != std::string::npos)
+        return {};
+    const size_t b = hlsl.find(end, a);
+    if (b == std::string::npos)
+        return {};
+    std::string h = hlsl;
+    h.erase(a, b + end.size() - a);
+    return h;
+}
+
+std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> g_noKillShaders;
+// The variant (its compile queued on first use unless the shader cache has it); may be pending or failed.
+// The base shader must be ready (its HLSL). Called with g_shaderMutex held.
+const CompiledShader* NoKillVariantOf(const CompiledShader& base)
+{
+    if (const CompiledShader* k = base.noKill)
+        return k;
+    const CompiledShader& source = base.hlslSource ? *base.hlslSource : base;
+    auto [it, inserted] = g_noKillShaders.try_emplace(source.cacheKey);
+    if (inserted)
+    {
+        it->second = std::make_unique<CompiledShader>();
+        CompiledShader& cs = *it->second;
+        cs.hash = source.hash;
+        cs.pixel = true;
+        cs.ucodeBE = source.ucodeBE;
+        cs.info = source.info;
+        cs.info.hlsl = NoKillVariant(source.info.hlsl);
+        if (cs.info.hlsl.empty())
+        {
+            LOG_ONCE("renderer: no alpha-test-free variant for ps %016llx", (unsigned long long)source.hash);
+            cs.state = CompiledShader::Failed;
+        }
+        else
+        {
+            cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), 1);
+            if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
+            {
+                cs.code = b->second;
+                cs.state = CompiledShader::Ready;
+            }
+            else if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
+            {
+                const auto size = size_t(in.tellg());
+                if (size && SUCCEEDED(D3DCreateBlob(size, &cs.code)))
+                {
+                    in.seekg(0);
+                    in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
+                    cs.state = CompiledShader::Ready;
+                    g_bytecode.emplace(cs.cacheKey, cs.code);
+                }
+            }
+            if (!cs.IsReady())
+                g_compiler.PushQuiet(&cs);
+        }
+    }
+    base.noKill = it->second.get();
+    return base.noKill;
 }
 
 D3D12_BLEND Blend(uint32_t f)
@@ -4480,10 +4696,17 @@ struct PipelinePool
     }
 };
 
-std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& ps, const PipelineKey& key)
+std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& psIn, const PipelineKey& key)
 {
     if (auto it = g_r.pipelines.find(key); it != g_r.pipelines.end())
         return it->second;
+    // Flag 8 (no alpha test): the manifest and re-warms pass the base pixel shader; use its variant when that
+    // is ready, else the base (the same picture, as pinfo.x is 7 for these draws, just no gain).
+    const CompiledShader* psUse = &psIn;
+    if ((key.flags & 8) && psIn.IsReady() && psIn.noKill != &psIn)
+        if (const CompiledShader* k = NoKillVariantOf(psIn); k && k != &psIn && k->IsReady())
+            psUse = k;
+    const CompiledShader& ps = *psUse;
     const uint32_t blend = key.blend, depth = key.depth;
     const uint32_t mask = (key.stencilMaskMode >> 24) & 0xF, mode = (key.stencilMaskMode >> 28) & 7, stencil = key.stencilMaskMode & 0xFFFFFF;
     const bool alphaToMask = key.flags & 1, cullable = (key.flags >> 1) & 1;
@@ -4729,7 +4952,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
 }
 
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
-    bool coverage = false)
+    bool coverage = false, bool noKill = false)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (coverage)
@@ -4743,6 +4966,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= 4;
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
+    if (noKill)
+        key.flags |= 8; // the pixel shader's variant without the alpha test (NoKillVariantOf)
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
@@ -4756,10 +4981,31 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     }
     if (lastPso && memcmp(&key, &lastKey, sizeof(key)) == 0)
         return lastPso;
+    // Then a direct-mapped copy of what the map holds: draws mostly repeat a recent pipeline, and the map's
+    // node hop was most of GetPipeline's ~2% of the command processor (measured on FM2).
+    // REGPU_PIPELINE_MAP_ONLY=1 (live): the map alone (A/B).
+    struct Recent
+    {
+        PipelineKey key{};
+        ID3D12PipelineState* pso = nullptr;
+        uint32_t gen = ~0u;
+    };
+    thread_local Recent recent[128];
+    static LiveSwitch pipelineMapOnly("REGPU_PIPELINE_MAP_ONLY");
+    const bool useRecent = !pipelineMapOnly;
+    Recent& hot = recent[size_t(uint64_t(PipelineKeyHash{}(key)) * 0x9E3779B97F4A7C15ull >> 57)];
+    if (useRecent && hot.pso && hot.gen == gen && memcmp(&hot.key, &key, sizeof(key)) == 0)
+    {
+        lastKey = key;
+        lastPso = hot.pso;
+        return hot.pso;
+    }
     if (auto r = ready.find(key); r != ready.end())
     {
         lastKey = key;
         lastPso = r->second;
+        if (useRecent)
+            hot = { key, r->second, gen };
         return r->second;
     }
     std::shared_ptr<PipelineEntry> entry;
@@ -4773,6 +5019,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         {
             ready.emplace(key, it->second->pso.Get());
+            if (useRecent)
+                hot = { key, it->second->pso.Get(), gen };
             return it->second->pso.Get();
         }
         entry = EnsurePipeline(vs, ps, key);
@@ -4791,6 +5039,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
             Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
     return pso;
 }
+
+const ResolvedTexture* ResolvedFor(const TextureFetch& fetch);
 
 // Cube textures: six faces, each a padded 2D slice. Faces the title rendered
 // and resolved (dynamic reflections) are copied from their host textures every
@@ -4896,8 +5146,11 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     bool resolved = false;
     for (uint32_t i = 0; i < 6; i++)
     {
-        // (Through the stale check: a face address the title reused for a texture of its own.)
-        const ResolvedTexture* r = ResolveCurrent(fetch.Address() + i * stride);
+        // ResolvedFor: never for a compressed cube, and not once the title has reused the memory (a DXT5
+        // reflection cube landing on an old resolve reflected that resolve).
+        TextureFetch face = fetch;
+        face.dwords[1] = (face.dwords[1] & 0xFFF) | ((fetch.Address() + i * stride) & 0xFFFFF000);
+        const ResolvedTexture* r = ResolvedFor(face);
         if (r && r->format != DXGI_FORMAT_R32_FLOAT && r->width >= w && r->height >= h)
         {
             faces[i] = r;
@@ -7531,12 +7784,12 @@ void PredictBeginImpl()
 {
     g_predVs = C().vsHash;
     g_predPs = C().psHash;
-    g_predVsCode = C().vsCode.data();
-    g_predPsCode = C().psCode.data();
+    g_predVsCode = C().vsCode->data();
+    g_predPsCode = C().psCode->data();
     g_predVsOwn.reset(); // the command list's own copy stays valid
     g_predPsOwn.reset();
-    g_predVsDwords = uint32_t(C().vsCode.size());
-    g_predPsDwords = uint32_t(C().psCode.size());
+    g_predVsDwords = uint32_t(C().vsCode->size());
+    g_predPsDwords = uint32_t(C().psCode->size());
 }
 
 std::vector<PipelineKey> g_seedLater; // seed pipelines waiting for a shader the game makes at run time
@@ -8026,24 +8279,38 @@ void RendererSaveCaches()
     g_pipelineLibrary.MaybeSave(true);
 }
 
+// =1: one code buffer per stage, copied at every shader change, as before ShaderCodeCache (A/B).
+LiveSwitch g_sw_REGPU_SHADER_CODE_ONE_SLOT("REGPU_SHADER_CODE_ONE_SLOT");
+
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
-    std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
-    uint64_t& current = type == 0 ? C().vsHash : C().psHash;
+    DrawContext& c = C();
+    const std::vector<uint32_t>*& code = type == 0 ? c.vsCode : c.psCode;
+    uint64_t& current = type == 0 ? c.vsHash : c.psHash;
     // Titles reload the bound shader before most draws: the same hash is the same used microcode, so
     // the copy is already there (FH1: ~2% of the draw thread on an FX-8350). REGPU_NO_SAME_SHADER_SKIP=1: copy anyway.
     static LiveSwitch noSkip("REGPU_NO_SAME_SHADER_SKIP");
-    if (current == hash && code.size() == usedDwords && !noSkip)
+    if (current == hash && code->size() == usedDwords && !noSkip)
         return;
-    code.assign(microcodeBE, microcodeBE + usedDwords);
+    // A shader loaded lately is still in its slot (same hash and size, same words: as above). Slots live
+    // until a shader with the same index replaces them (measured on FM2: fewer copies on shader switches).
+    if (!c.codeCache)
+        c.codeCache = std::make_unique<ShaderCodeCache>();
+    const bool oneSlot = g_sw_REGPU_SHADER_CODE_ONE_SLOT;
+    ShaderCodeCache::Slot& slot = c.codeCache->slots[type != 0][oneSlot ? 0 : (hash ^ hash >> 32) & 127];
+    if (slot.hash != hash || slot.code.size() != usedDwords || oneSlot || noSkip)
+    {
+        slot.code.assign(microcodeBE, microcodeBE + usedDwords);
+        slot.hash = hash;
+    }
+    code = &slot.code;
     current = hash;
 }
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
-    std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
-    code.assign(microcodeBE, microcodeBE + ucode::UsedDwords(microcodeBE, dwords));
-    (type == 0 ? C().vsHash : C().psHash) = Fnv(code.data(), code.size() * 4) ^ type;
+    const uint32_t used = ucode::UsedDwords(microcodeBE, dwords);
+    RendererSetShader(type, microcodeBE, used, Fnv(microcodeBE, size_t(used) * 4) ^ type);
 }
 
 namespace
@@ -8661,7 +8928,10 @@ void TranslatePiece(DrawContext& ctx, uint32_t i)
     ID3D12GraphicsCommandList* real = AcquireList();
     RecordedList recorder;
     recorder.Init(real, true);
+    // The shader code cache survives the reset: shaders recur across pieces, and slots go by hash and size.
+    std::unique_ptr<ShaderCodeCache> codeCache = std::move(ctx.codeCache);
     ctx = DrawContext{};
+    ctx.codeCache = std::move(codeCache);
     ctx.list = &recorder;
     ctx.worker = true;
     DrawContext* saved = t_context;
@@ -9497,7 +9767,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!vizQueryDraws && (gpureg::Get(0x2293 /* PA_SC_VIZ_QUERY */) >> 7 & 1))
     {
         TraceSkip("viz query survey", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     if (!g_r.ok)
@@ -9522,15 +9792,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if (h == C().vsHash || h == C().psHash)
             {
                 TraceSkip("REGPU_SKIP_SHADERS", initiator);
-                g_r.skippedThisFrame++;
+                Bump(g_r.skippedThisFrame);
                 return;
             }
             p = *end ? end + 1 : end;
         }
-    if ((edramMode != 4 && edramMode != 5) || C().vsCode.empty() || C().psCode.empty())
+    if ((edramMode != 4 && edramMode != 5) || C().vsCode->empty() || C().psCode->empty())
     {
         TraceSkip("edram mode", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     {
@@ -9539,7 +9809,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // right away; now that set covers the game, and the 512 MB scan (~18 ms on this
         // thread) only showed as a frame spike, so once the game runs the low-priority
         // background scan is enough.
-        const bool unseen = g_r.shaders.find(C().vsHash) == g_r.shaders.end() || g_r.shaders.find(C().psHash) == g_r.shaders.end();
+        const bool unseen = !ShaderInMap(C().vsHash) || !ShaderInMap(C().psHash);
         static auto lastScan = std::chrono::steady_clock::time_point{};
         LiveSwitch &noScan = g_sw_REGPU_NO_SHADER_SCAN;
         if (unseen && !noScan)
@@ -9567,13 +9837,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         PsAlias() : real(C().psHash), realVs(C().vsHash) { C().psHash = PsEditAlias(real); C().vsHash = PsEditAlias(realVs); }
         ~PsAlias() { C().psHash = real; C().vsHash = realVs; }
     } psAlias;
-    const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
+    const CompiledShader& vs = GetShader(C().vsHash, *C().vsCode, false);
     if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
     {
         std::lock_guard lock(g_drawStatsMutex);
         g_drawStatsCounts[{ psAlias.realVs, psAlias.real }]++;
     }
-    const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
+    const CompiledShader& ps = GetShader(C().psHash, *C().psCode, true);
     Section(1);
     LiveSwitch &asyncShaders = g_sw_REGPU_ASYNC_SHADERS;
     const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
@@ -9592,7 +9862,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!vs.IsReady() || !ps.IsReady())
     {
         TraceSkip(vs.state == CompiledShader::Failed || ps.state == CompiledShader::Failed ? "shader" : "compiling", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     // A fetch from vertex fetch constant 96 or above (index field past the 96 slots) has no
@@ -9602,7 +9872,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (k >= 96)
         {
             TraceSkip("invalid vertex fetch constant", initiator);
-            g_r.skippedThisFrame++;
+            Bump(g_r.skippedThisFrame);
             return;
         }
     // Triangle lists and restart-free strips read their indices on the GPU;
@@ -9651,7 +9921,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (directIndex ? directVertices == 0 : (!indexEntry || list.empty()))
     {
         TraceSkip("primitive", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     Section(2);
@@ -9693,7 +9963,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (skipThis || sweepSkip || (skipTo && g_r.frame + 1 == dumpFrame && g_r.drawsThisFrame >= skipFrom && g_r.drawsThisFrame < skipTo))
         {
-            g_r.drawsThisFrame++;
+            Bump(g_r.drawsThisFrame);
             return;
         }
     }
@@ -9712,7 +9982,26 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!pso)
     {
         motion = false;
-        pso = GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex);
+        // No alpha test for this draw (pinfo.x 7, as set below) and no alpha-to-mask: the pixel shader's variant
+        // without the alpha-test switch, once it is compiled. Depth-only passes keep the base shader whenever the
+        // alpha test bit is on (their own rule for it is below). REGPU_NO_SPLIT_ALPHA_TEST=1 (live): off.
+        const CompiledShader* psUsed = &ps;
+        if (static LiveSwitch noSplit("REGPU_NO_SPLIT_ALPHA_TEST"); !noSplit && ps.IsReady() && !IsPsEditAlias(C().psHash))
+        {
+            const uint32_t cc = gpureg::Get(RB_COLORCONTROL);
+            if (!(((cc >> 3) & 1) && (cc & 7) != 7) && !((cc >> 4) & 1))
+            {
+                const CompiledShader* k = ps.noKill;
+                if (!k)
+                {
+                    std::lock_guard shaderLock(g_shaderMutex);
+                    k = NoKillVariantOf(ps);
+                }
+                if (k->IsReady())
+                    psUsed = k;
+            }
+        }
+        pso = GetPipeline(vs, *psUsed, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps);
     }
     if (!pso)
     {
@@ -9752,7 +10041,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (listOffset == ~0ull)
     {
         TraceSkip("ring full", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
 
@@ -9787,7 +10076,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (vsOffset == ~0ull || psOffset == ~0ull)
     {
         TraceSkip("ring full", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     // The float constants go straight to the ring (only those the shaders read); the rest of each
@@ -9870,10 +10159,31 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
     }
     Sub(0); // index list, ring allocations, float constants
-    for (uint32_t i = 0; i < 8; i++)
-        vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
-    for (uint32_t i = 0; i < 32; i++)
-        vc->l[i] = pc->l[i] = gpureg::Get(gpureg::LoopConstants + i);
+    // Bool and loop constants only for the shaders that read them (TranslatedShader::readsBools/readsLoops):
+    // most read no bools and loops almost never, and each block was 160 bytes a draw into the write-combined
+    // ring (measured on FM2 on an FX-8350). What is skipped stays stale and is never read. Hooked draws (the
+    // game's onDraw) get all. REGPU_ALL_BOOL_LOOP=1 (live): all, as before (A/B).
+    const bool allBoolLoop = g_sw_REGPU_ALL_BOOL_LOOP || g_sw_REGPU_FULL_CONSTANT_BLOCKS || hooked;
+    const bool vsBools = allBoolLoop || vs.info.readsBools, psBools = allBoolLoop || ps.info.readsBools;
+    const bool vsLoops = allBoolLoop || vs.info.readsLoops, psLoops = allBoolLoop || ps.info.readsLoops;
+    if (vsBools || psBools)
+        for (uint32_t i = 0; i < 8; i++)
+        {
+            const uint32_t v = gpureg::Get(gpureg::BoolConstants + i);
+            if (vsBools)
+                vc->b[i] = v;
+            if (psBools)
+                pc->b[i] = v;
+        }
+    if (vsLoops || psLoops)
+        for (uint32_t i = 0; i < 32; i++)
+        {
+            const uint32_t v = gpureg::Get(gpureg::LoopConstants + i);
+            if (vsLoops)
+                vc->l[i] = v;
+            if (psLoops)
+                pc->l[i] = v;
+        }
     // Debug: REGPU_FORCE_BOOL=<index>:<0|1> forces one boolean constant for every draw.
     if (static const char* force = getenv("REGPU_FORCE_BOOL"); force)
     {
@@ -9881,8 +10191,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         static const bool parsed = sscanf(force, "%u:%u", &index, &value) == 2 && index < 256;
         if (parsed)
         {
-            const uint32_t bit = 1u << (index & 31);
-            vc->b[index >> 5] = pc->b[index >> 5] = value ? (pc->b[index >> 5] | bit) : (pc->b[index >> 5] & ~bit);
+            // Each block from its own words (a block not filled this draw holds stale ones).
+            const uint32_t bit = 1u << (index & 31), w = index >> 5;
+            if (vsBools)
+                vc->b[w] = value ? (vc->b[w] | bit) : (vc->b[w] & ~bit);
+            if (psBools)
+                pc->b[w] = value ? (pc->b[w] | bit) : (pc->b[w] & ~bit);
         }
     }
     Sub(1); // bools, loops
@@ -9976,7 +10290,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (dataOffset == ~0ull)
         {
             TraceSkip("ring full", initiator);
-            g_r.skippedThisFrame++;
+            Bump(g_r.skippedThisFrame);
             return;
         }
         vc->vf[k][0] = uint32_t(dataOffset);
@@ -10115,7 +10429,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         // (The shader's own index fetch can't restart a strip.)
         TraceSkip("strip cut", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     if (indexedCount)
@@ -10199,8 +10513,21 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // clearing all 32 was 1 KB a draw (3.5% of the command processor in PGR4's races on an FX-8350).
     {
         const size_t clear = g_sw_REGPU_FULL_CONSTANT_BLOCKS ? 32 : usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
-        memset(pc->tinfo, 0, clear * sizeof(pc->tinfo[0]));
-        memset(pc->tbias, 0, clear * sizeof(pc->tbias[0]));
+        // A wide, sparse set only clears its gaps: the loop below writes every used slot. A few low slots
+        // keep the two memsets, which are cheaper than a loop. REGPU_SLOT_CLEAR_ALL=1: always the memsets.
+        static LiveSwitch slotClearAll("REGPU_SLOT_CLEAR_ALL");
+        if (clear <= 8 || g_sw_REGPU_FULL_CONSTANT_BLOCKS || slotClearAll)
+        {
+            memset(pc->tinfo, 0, clear * sizeof(pc->tinfo[0]));
+            memset(pc->tbias, 0, clear * sizeof(pc->tbias[0]));
+        }
+        else
+            for (uint32_t m = ~usedSlots & uint32_t((1ull << clear) - 1); m; m &= m - 1)
+            {
+                const uint32_t s = uint32_t(__builtin_ctz(m));
+                memset(pc->tinfo[s], 0, sizeof(pc->tinfo[0]));
+                memset(pc->tbias[s], 0, sizeof(pc->tbias[0]));
+            }
     }
     if (g_bindingsFrame != g_r.frame || g_bindingsEpoch != g_resolveEpoch)
     {
@@ -10218,7 +10545,19 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             bindingKey = (bindingKey ^ d) * 0x100000001B3ull;
         SlotBinding& memo = g_bindings[(bindingKey ^ bindingKey >> 29) & (kBindingSlots - 1)];
         static const bool noSlotMemo = getenv("REGPU_NO_SLOT_MEMO") != nullptr || getenv("REGPU_DUMP_PS_TEXTURES") != nullptr;
-        if (!noSlotMemo && memo.frame == g_r.frame && memo.epoch == g_resolveEpoch && memcmp(memo.fetch, fetch.dwords, sizeof(memo.fetch)) == 0)
+        bool reuse = !noSlotMemo && memo.frame == g_r.frame && memcmp(memo.fetch, fetch.dwords, sizeof(memo.fetch)) == 0;
+        if (reuse && memo.epoch != g_resolveEpoch)
+        {
+            // A resolve since. A plain 2D texture's binding came from this frame's GetTexture and BindlessIndex
+            // maps, so it still holds unless a resolve now covers its address or the scene scale changed the
+            // LOD bias; every resolve used to rebuild all of them. ResolvedFor last: it only runs for candidates.
+            // REGPU_BINDING_EPOCH_STRICT=1 (live): rebuilt after every resolve, as before (A/B).
+            static LiveSwitch epochStrict("REGPU_BINDING_EPOCH_STRICT");
+            reuse = memo.resolveFree && !epochStrict && !RendererTracing() && memo.lodShift == LodShift() && !ResolvedFor(fetch);
+            if (reuse)
+                memo.epoch = g_resolveEpoch;
+        }
+        if (reuse)
         {
             memcpy(pc->tinfo[slot], memo.tinfo, sizeof(memo.tinfo));
             memcpy(pc->tbias[slot], memo.tbias, sizeof(memo.tbias));
@@ -10322,8 +10661,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Below the output resolution (a temporal upscaler's scene) the mips are biased sharper by log2 of the
         // scale (-0.58 at 67%), as upscalers ask, so the upscaled image keeps the output's texture detail
         // (from the FM4 port). REGPU_NO_LOD_BIAS=1 (live): the fetch's bias alone.
-        static LiveSwitch noLodBias("REGPU_NO_LOD_BIAS");
-        tb[0] = fetch.LodBias() + (g_sceneScale < 1.0f && !noLodBias ? std::log2(g_sceneScale) : 0.0f);
+        const float lodShift = LodShift();
+        tb[0] = fetch.LodBias() + lodShift;
         memcpy(&tb[1], &index, 4);
         // A resolved texture is as wide as the pitch it was resolved with; the fetch
         // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
@@ -10344,6 +10683,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         memcpy(pc->tinfo[slot], ti, sizeof(ti));
         memcpy(pc->tbias[slot], tb, sizeof(tb));
         memo.samplesResolve = g_drawSamplesResolve;
+        // Revivable after a resolve (above) on two assumptions: only Resolve() bumps g_resolveEpoch, and
+        // GetTexture's non-resolve path depends only on per-frame state (its frame maps, the texture checks).
+        memo.resolveFree = !cube && !volume && texture && !resolvedPtr && !memo.samplesResolve && !RendererTracing();
+        memo.lodShift = lodShift;
         g_drawSamplesResolve |= samplesBefore;
     }
     pc->info[2] = 0;
@@ -10451,7 +10794,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);
-        g_r.skippedThisFrame++;
+        Bump(g_r.skippedThisFrame);
         return;
     }
     D3D12_RECT hostScissor = ToHost(scissor);
@@ -10629,12 +10972,37 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 fetches = std::max(fetches, k + 1);
             const size_t layouts = std::min<size_t>(vs.info.vertexFetchLayout.size(), 32);
             const uint32_t slots = usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
-            put(vcRing, vc, vsFrom, offsetof(VSConstants, vf));
-            put(vcRing, vc, offsetof(VSConstants, vf), offsetof(VSConstants, vf) + fetches * sizeof(vc->vf[0]));
+            if (allBoolLoop)
+                put(vcRing, vc, vsFrom, offsetof(VSConstants, vf));
+            else
+            {
+                if (vsBools)
+                    put(vcRing, vc, offsetof(VSConstants, b), offsetof(VSConstants, l));
+                if (vsLoops)
+                    put(vcRing, vc, offsetof(VSConstants, l), offsetof(VSConstants, vf));
+            }
+            // The fetch entries the shader reads, each on its own: a title keeping a stream in a high fetch
+            // constant (FM2: 95) made "up to the highest" the whole 1.5 KB table on almost every draw (FM2 on the
+            // FX: 75.3 -> 87.5 fps). REGPU_VF_TABLE_COPY=1 (live): the old range.
+            if (static LiveSwitch tableCopy("REGPU_VF_TABLE_COPY"); tableCopy)
+                put(vcRing, vc, offsetof(VSConstants, vf), offsetof(VSConstants, vf) + fetches * sizeof(vc->vf[0]));
+            else
+                for (uint32_t k : vs.info.vertexFetchConstants)
+                    if (k < 96)
+                        memcpy(reinterpret_cast<uint8_t*>(vcRing) + offsetof(VSConstants, vf) + k * sizeof(vc->vf[0]), vc->vf[k], sizeof(vc->vf[0]));
             put(vcRing, vc, offsetof(VSConstants, info), offsetof(VSConstants, vfl));
             put(vcRing, vc, offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]));
             put(vcRing, vc, offsetof(VSConstants, vuser), sizeof(VSConstants));
-            put(pcRing, pc, psFrom, offsetof(PSConstants, tinfo));
+            if (allBoolLoop)
+                put(pcRing, pc, psFrom, offsetof(PSConstants, tinfo));
+            else
+            {
+                if (psBools)
+                    put(pcRing, pc, offsetof(PSConstants, b), offsetof(PSConstants, l));
+                if (psLoops)
+                    put(pcRing, pc, offsetof(PSConstants, l), offsetof(PSConstants, info));
+                put(pcRing, pc, offsetof(PSConstants, info), offsetof(PSConstants, tinfo)); // info, info2
+            }
             put(pcRing, pc, offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]));
             put(pcRing, pc, offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]));
         }
@@ -10695,7 +11063,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF,
-            g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
+            g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, *C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
         Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
             hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
             static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
@@ -10871,7 +11239,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (C().worker)
         C().draws++;
     else
-        g_r.drawsThisFrame++;
+        Bump(g_r.drawsThisFrame);
     // REGPU_SUBMIT_DRAWS=<n>: submit the frame so far every n draws (never inside an occlusion query), so
     // the GPU starts on it while the rest is recorded (pgr4-native). Off by default: FM2's race, already
     // GPU-bound, lost 4-17% at n = 128-512. It may help a game whose GPU waits on recording.
@@ -11698,7 +12066,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     ID3D12CommandList* lists[] = { C().list->Real() };
     SubmitLists(1, lists);
     if (presenting)
-        PresenterPresent();
+        PresenterPresentAsync(); // on the presenter's thread: Present was 4-5% of FM2's command processor
     Frame().fence = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
     overwrite::EndFrame(g_r.frameIndex, Frame().fence, g_r.frame);
@@ -11859,6 +12227,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     g_r.frameIndex = (g_r.frameIndex + 1) % kFrames;
 }
 
+const std::atomic<uint64_t>& g_rendererHotkeyFrame = g_hotkeyFrame;
+const uint64_t& g_rendererTraceDrawsEnv = g_traceDrawsEnv;
+const uint64_t& g_rendererFrame = g_r.frame;
 bool RendererTracing()
 {
     const uint64_t traceFrame = TraceFrame();
@@ -11912,6 +12283,7 @@ uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr)
         g_psEditAlias[hash] = alias;
         g_psEditExpr[alias] = expr;
         g_psEditEver.insert(alias);
+        g_psEditMade.store(true, std::memory_order_relaxed);
     }
     g_psEdits = !g_psEditAlias.empty();
     return alias;

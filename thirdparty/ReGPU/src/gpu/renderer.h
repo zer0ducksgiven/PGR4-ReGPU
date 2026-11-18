@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 // Native renderer, called on the command processor thread.
@@ -30,6 +31,17 @@ void BenchmarkRecord(bool on);
 void BenchmarkWriteReport(const char* path);
 // True while REGPU_TRACE_DRAWS's frame is being recorded.
 bool RendererTracing();
+// False whenever RendererTracing is (no traced frame still ahead): inline, for the command
+// processor's per-packet check. (The references are defined in renderer.cpp.)
+extern const std::atomic<uint64_t>& g_rendererHotkeyFrame;
+extern const uint64_t& g_rendererTraceDrawsEnv;
+extern const uint64_t& g_rendererFrame;
+inline bool RendererTraceArmed()
+{
+    // (RendererTracing wants the trace frame == frame + 1: a frame already past is not armed.)
+    const uint64_t frame = g_rendererFrame;
+    return g_rendererHotkeyFrame.load(std::memory_order_relaxed) > frame || g_rendererTraceDrawsEnv > frame;
+}
 
 // Parallel draw translation (gpu.cpp cuts the draw stream between resolves into pieces).
 #include <functional>

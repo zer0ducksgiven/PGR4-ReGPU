@@ -51,6 +51,7 @@ public sealed class GameSettings
     public bool Enhance { get; set; }
     public bool SkipIntro { get; set; }
     public bool LowPerformance { get; set; }
+    public bool ThreadPinning { get; set; } = true; // main thread and GPU command processor on a core each
     public int Language { get; set; } = 1;
     public int Anisotropy { get; set; } = -1; // -1 the game's own filtering
     // Racing wheels (the Controls tab): force feedback and centring spring (percent), the force reversed, the rotation
@@ -65,7 +66,7 @@ public sealed class GameSettings
     public int RenderScale { get; set; } = 100;
     public int Sharpening { get; set; }
 
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "enhance", "skip_intro", "low_performance", "language", "anisotropy", "hide_shader_overlay", "upscaler", "upscale_quality", "sharpness", "wheel_strength", "wheel_spring", "wheel_reverse", "wheel_rotation"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "enhance", "skip_intro", "low_performance", "thread_pinning", "language", "anisotropy", "hide_shader_overlay", "upscaler", "upscale_quality", "sharpness", "wheel_strength", "wheel_spring", "wheel_reverse", "wheel_rotation"];
     // upscale_quality's presets (src/settings.cpp SceneScale): native, 1.5x, 1.7x, 2x and 3x per axis.
     static readonly int[] QualityScale = [100, 67, 59, 50, 33];
 
@@ -99,6 +100,7 @@ public sealed class GameSettings
                 case "enhance": break; // (enhanced lighting is off for now)
                 case "skip_intro": s.SkipIntro = v == "1"; break;
                 case "low_performance": s.LowPerformance = v == "1"; break;
+                case "thread_pinning": s.ThreadPinning = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
             }
         // FSR 3 and DLSS aren't in this build: anything but fsr1 is off.
@@ -117,7 +119,7 @@ public sealed class GameSettings
         var sb = new StringBuilder("# Project Gotham Racing 4 (pgr4) settings; the launcher edits this file.\n");
         sb.Append($"profile={(profile.Length > 0 ? profile : "Player")}\n");
         sb.Append($"resolution={Resolution}\naspect={Aspect}\nfullscreen={B(Fullscreen)}\nvsync={B(Vsync)}\n");
-        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nenhance=0\nskip_intro={B(SkipIntro)}\nlow_performance={B(LowPerformance)}\nlanguage={Language}\n");
+        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nenhance=0\nskip_intro={B(SkipIntro)}\nlow_performance={B(LowPerformance)}\nthread_pinning={B(ThreadPinning)}\nlanguage={Language}\n");
         sb.Append($"anisotropy={(Anisotropy < 0 ? -1 : Math.Clamp(Anisotropy, 0, 16))}\nhide_shader_overlay={B(HideShaderOverlay)}\n");
         sb.Append($"wheel_strength={Math.Clamp(WheelStrength, 0, 100)}\nwheel_spring={Math.Clamp(WheelSpring, 0, 100)}\nwheel_reverse={B(WheelReverse)}\nwheel_rotation={Math.Clamp(WheelRotation, 0, 3600)}\n");
         // The nearest preset to the render scale; FSR 1 on below 100% or with sharpening.

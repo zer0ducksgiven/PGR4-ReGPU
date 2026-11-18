@@ -1,6 +1,7 @@
 // The live debug server: one client at a time on 127.0.0.1, a line per command, a line of JSON back.
 // See tools/regpuctl.py for the commands. Input is merged into player 1's pad, screenshots are taken by the
 // renderer at its next swap, and the waits block this thread only.
+#include "fast_env.h"
 #include "debug.h"
 
 #include <winsock2.h>
@@ -522,6 +523,7 @@ std::string Handle(const std::string& line)
         value.erase(0, value.find_first_not_of(' '));
         _putenv_s(name.c_str(), value.c_str());
         SetEnvironmentVariableA(name.c_str(), value.empty() ? nullptr : value.c_str());
+        FastEnvChanged();
         return Ok();
     }
     if (cmd == "quit")

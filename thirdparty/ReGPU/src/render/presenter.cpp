@@ -16,6 +16,9 @@
 #include "log.h"
 #include "render/presenter.h"
 #include "settings.h"
+#include "live_switch.h"
+
+static void WaitAsyncPresent(); // with PresenterPresentAsync
 
 using Microsoft::WRL::ComPtr;
 
@@ -229,12 +232,20 @@ void CreateWindowAndDevice()
         SizeWindow(g_p.window, outW, outH);
         ShowWindow(g_p.window, SW_SHOW);
     }
-    // Both modes present into a child window, so regpu::SetFullscreen can switch while the game runs
-    // without a new swap chain.
+    // The swap chain goes on the window itself, except fullscreen at an aspect ratio other than the display's:
+    // there the picture is a child window between black bars (LayoutSurface). A child covering the whole
+    // display showed black while focused on an AMD card (FM2 report #59). Switching live into fullscreen at
+    // another aspect ratio stretches the picture until the next start.
     if (!settings.hostWindow)
     {
-        g_p.surface = CreateWindowExW(0, L"regpu", nullptr, WS_CHILD | WS_VISIBLE | WS_DISABLED, 0, 0, 1, 1, g_p.window, nullptr, wc.hInstance, nullptr);
-        LayoutSurface();
+        RECT client{};
+        GetClientRect(g_p.window, &client);
+        if (g_p.fullscreen && int64_t(client.right) * outH != int64_t(client.bottom) * outW)
+        {
+            g_p.surface = CreateWindowExW(0, L"regpu", nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, g_p.window, nullptr, wc.hInstance, nullptr);
+            LayoutSurface();
+        }
+        Log("presenter: picture in %s", g_p.surface ? "a child window (black bars)" : "the game window");
     }
 
     ComPtr<IDXGIFactory4> factory;
@@ -306,6 +317,7 @@ void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RE
 
 void DrawFrame(uint64_t frame)
 {
+    WaitAsyncPresent();
     const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
     if (g_p.fence->GetCompletedValue() < g_p.fenceValues[i])
     {
@@ -413,6 +425,7 @@ bool PresenterHasFocus()
 // The swap chain to a new output size (the renderer's ApplyOutputSize, the host GPU idle).
 void PresenterResize(uint32_t width, uint32_t height)
 {
+    WaitAsyncPresent();
     if (!g_p.swapChain)
         return;
     for (auto& b : g_p.backBuffers)
@@ -435,7 +448,7 @@ void PresenterResize(uint32_t width, uint32_t height)
 
 void regpu::SetFullscreen(bool on)
 {
-    if (!g_p.window || !g_p.surface || g_p.fullscreen == on)
+    if (!g_p.window || GetSettings().hostWindow || g_p.fullscreen == on)
         return;
     g_p.fullscreen = on;
     GetSettings().fullscreen = on;
@@ -496,6 +509,7 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
 {
     if (!g_p.ready)
         return false;
+    WaitAsyncPresent();
     const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
     ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
     D3D12_RESOURCE_BARRIER b{};
@@ -548,7 +562,57 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
     return true;
 }
 
+// The renderer's Present on a thread of its own (PresenterPresentAsync, from FM2): the call is 0.15-0.2 ms a
+// frame (4-5% of FM2's command processor). One at a time; everything that touches the swap chain or its back
+// buffers waits for it first (WaitAsyncPresent), so the next frame never records into a buffer that is still
+// waiting to be shown.
+static std::mutex g_asyncPresentMutex;
+static std::condition_variable g_asyncPresentCv;
+static bool g_asyncPresentPending = false;
+static void PresentNow();
+
+static void WaitAsyncPresent()
+{
+    std::unique_lock lock(g_asyncPresentMutex);
+    g_asyncPresentCv.wait(lock, [] { return !g_asyncPresentPending; });
+}
+
+void PresenterPresentAsync()
+{
+    // REGPU_SYNC_PRESENT=1 (live): inline, as before.
+    static LiveSwitch sync("REGPU_SYNC_PRESENT");
+    if (sync)
+        return PresenterPresent();
+    static std::thread worker([] {
+        SetThreadDescription(GetCurrentThread(), L"Present");
+        for (;;)
+        {
+            {
+                std::unique_lock lock(g_asyncPresentMutex);
+                g_asyncPresentCv.wait(lock, [] { return g_asyncPresentPending; });
+            }
+            PresentNow();
+            {
+                std::lock_guard lock(g_asyncPresentMutex);
+                g_asyncPresentPending = false;
+            }
+            g_asyncPresentCv.notify_all();
+        }
+    });
+    std::unique_lock lock(g_asyncPresentMutex);
+    g_asyncPresentCv.wait(lock, [] { return !g_asyncPresentPending; });
+    g_asyncPresentPending = true;
+    lock.unlock();
+    g_asyncPresentCv.notify_all();
+}
+
 void PresenterPresent()
+{
+    WaitAsyncPresent();
+    PresentNow();
+}
+
+static void PresentNow()
 {
     // Vsync: wait for the display's refresh; off: present at once (tearing allowed).
     if (g_p.ready)

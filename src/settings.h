@@ -18,6 +18,7 @@ struct Settings
     uint32_t language = 1;               // the console language the game sees (XGetLanguage: 1 English, 3 German, ...)
     uint32_t msaa = 1;                   // anti-aliasing samples per pixel: 1 (off), 2, 4 or 8
     bool lowPerformance = false;         // old CPUs: renderer optimisations that cost them are off (regpu Config)
+    bool threadPinning = true;           // the main thread and the command processor get a core each (kernel/thread.cpp, PGR4_PIN)
     int anisotropy = -1;                 // texture filtering: -1 the game's own, 0 none (trilinear), 2-16 samples
     bool hideShaderOverlay = true;       // no shader compiler box in the corner (REGPU_NO_OVERLAY); on by default
     // The 0.1.2 renderer threading, each -1 auto (on), 0 off, 1 on (see regpu_host.cpp):

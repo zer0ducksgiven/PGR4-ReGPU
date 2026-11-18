@@ -46,6 +46,7 @@ struct ShaderUpload
     std::vector<uint32_t> words; // as uploaded (big-endian)
     uint32_t used = 0;           // ucode::UsedDwords
     uint64_t hash = 0;           // Fnv1a of the used dwords ^ type
+    uint32_t compare = 0;        // dwords a repeat must match (see FrameOnShaderLoad)
 };
 // Two generations: when the current one fills, the older one is dropped and the current
 // one becomes old (lookups promote what is still used). Clearing everything at once made
@@ -187,10 +188,22 @@ void CompositorLoop()
 
 const bool g_textureView = getenv("REGPU_TEXVIEW") != nullptr;
 
+// A repeat compares only the words its result depends on (ShaderUpload::compare). =1: every uploaded word (A/B).
+LiveSwitch g_shaderCompareAll("REGPU_SHADER_COMPARE_ALL");
+
 void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
 {
     if (!dwords || dwords > 0x10000)
         return;
+    // A record whose first `compare` words match gives the same used dwords, hash and code as a full match:
+    // UsedDwords reads only those, Fnv1a and RendererSetShader only the used ones.
+    const bool compareAll = g_shaderCompareAll;
+    const auto same = [&](const ShaderUpload* u) {
+        if (!u || u->words.size() != dwords)
+            return false;
+        const uint32_t n = compareAll ? dwords : u->compare;
+        return memcmp(u->words.data(), microcodeBE, size_t(n) * 4) == 0;
+    };
     const uint64_t at = uint64_t(guestAddress) << 32 ^ uint64_t(dwords) << 2 ^ uint32_t(type);
     if (g_uploads.bucket_count() < kUploadGeneration * 2)
         g_uploads.reserve(kUploadGeneration * 2);
@@ -200,25 +213,28 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
         ShaderUpload* u = slot.upload && g_rotations <= slot.rotation + 1 ? slot.upload : FindUpload(slot.key);
         if (u && u != slot.upload)
             slot.upload = u, slot.rotation = g_rotations;
-        if (u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+        if (same(u))
         {
             RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
             return;
         }
     }
     const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
-    if (const ShaderUpload* u = FindUpload(key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+    if (const ShaderUpload* u = FindUpload(key); same(u))
     {
         RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
         slot = { at, key, const_cast<ShaderUpload*>(u), g_rotations };
         return; // seen before: already logged and dumped
     }
     const uint32_t raw = dwords;
-    dwords = ucode::UsedDwords(microcodeBE, dwords);
+    uint32_t cfDwords = raw;
+    dwords = ucode::UsedDwords(microcodeBE, dwords, &cfDwords);
+    // All of them when UsedDwords fell back to the size; else the used ones and the control flow it read.
+    const uint32_t compare = dwords >= raw ? raw : std::min(raw, std::max(dwords, cfDwords));
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
     RendererSetShader(uint32_t(type), microcodeBE, dwords, hash);
     RotateUploads();
-    ShaderUpload& upload = g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
+    ShaderUpload& upload = g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash, compare };
     slot = { at, key, &upload, g_rotations };
     if (!g_shaders.insert(hash).second)
         return;

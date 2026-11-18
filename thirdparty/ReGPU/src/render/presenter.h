@@ -31,6 +31,7 @@ ID3D12CommandQueue* RenderQueue();
 // overlay (COPY_SOURCE RGBA8, overlayW x overlayH) is copied over the top-left corner when given.
 bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay = nullptr, uint32_t overlayW = 0, uint32_t overlayH = 0);
 void PresenterPresent();
+void PresenterPresentAsync(); // the renderer's frame present, on the presenter's own thread (REGPU_SYNC_PRESENT=1: inline)
 // The swap chain to a new output size (host GPU idle; renderer.cpp ApplyOutputSize).
 void PresenterResize(uint32_t width, uint32_t height);
 // Called by the renderer: the presenter stops drawing its own frames.

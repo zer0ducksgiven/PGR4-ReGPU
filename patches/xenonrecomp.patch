@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..b8ad631 100644
+index fa91527..ba9f857 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -609,7 +609,9 @@ bool Recompiler::Recompile(
@@ -88,7 +88,16 @@ index fa91527..b8ad631 100644
      case PPC_INST_FRES:
          printSetFlushMode(false);
          println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
-@@ -1133,9 +1152,11 @@ bool Recompiler::Recompile(
+@@ -1043,7 +1062,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LDARX:
+-        print("\t{}.u64 = *(uint64_t*)(base + ", reserved());
++        print("\t{}.u64 = PPC_GUEST_LOAD(uint64_t, base + ", reserved());
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+         println("{}.u32);", r(insn.operands[2]));
+@@ -1133,16 +1152,18 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
          break;
  
@@ -100,6 +109,42 @@ index fa91527..b8ad631 100644
      case PPC_INST_LVX128:
          // NOTE: for endian swapping, we reverse the whole vector instead of individual elements.
          // this is accounted for in every instruction (eg. dp3 sums yzw instead of xyz)
+-        print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ((", v(insn.operands[0]));
++        print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(PPC_GUEST_VLOAD(base + ((", v(insn.operands[0]));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+-        println("{}.u32) & ~0xF))), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]));
++        println("{}.u32) & ~0xF)), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_LVLX:
+@@ -1151,7 +1172,7 @@ bool Recompiler::Recompile(
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+         println("{}.u32;", r(insn.operands[2]));
+-        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ({}.u32 & ~0xF))), simde_mm_load_si128((simde__m128i*)&VectorMaskL[({}.u32 & 0xF) * 16])));", v(insn.operands[0]), temp(), temp());
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(PPC_GUEST_VLOAD(base + ({}.u32 & ~0xF)), simde_mm_load_si128((simde__m128i*)&VectorMaskL[({}.u32 & 0xF) * 16])));", v(insn.operands[0]), temp(), temp());
+         break;
+ 
+     case PPC_INST_LVRX:
+@@ -1160,7 +1181,7 @@ bool Recompiler::Recompile(
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+         println("{}.u32;", r(insn.operands[2]));
+-        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, {}.u32 & 0xF ? simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ({}.u32 & ~0xF))), simde_mm_load_si128((simde__m128i*)&VectorMaskR[({}.u32 & 0xF) * 16])) : simde_mm_setzero_si128());", v(insn.operands[0]), temp(), temp(), temp());
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, {}.u32 & 0xF ? simde_mm_shuffle_epi8(PPC_GUEST_VLOAD(base + ({}.u32 & ~0xF)), simde_mm_load_si128((simde__m128i*)&VectorMaskR[({}.u32 & 0xF) * 16])) : simde_mm_setzero_si128());", v(insn.operands[0]), temp(), temp(), temp());
+         break;
+ 
+     case PPC_INST_LVSL:
+@@ -1187,7 +1208,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWARX:
+-        print("\t{}.u32 = *(uint32_t*)(base + ", reserved());
++        print("\t{}.u32 = PPC_GUEST_LOAD(uint32_t, base + ", reserved());
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+         println("{}.u32);", r(insn.operands[2]));
 @@ -1208,6 +1229,13 @@ bool Recompiler::Recompile(
          println("{}.u32));", r(insn.operands[2]));
          break;
@@ -145,14 +190,21 @@ index fa91527..b8ad631 100644
      case PPC_INST_MULHWU:
          println("\t{}.u64 = (uint64_t({}.u32) * uint64_t({}.u32)) >> 32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          if (strchr(insn.opcode->name, '.'))
-@@ -1634,6 +1678,7 @@ bool Recompiler::Recompile(
+@@ -1634,11 +1678,12 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_STVX:
 +    case PPC_INST_STVXL:
      case PPC_INST_STVX128:
-         print("\tsimde_mm_store_si128((simde__m128i*)(base + ((");
+-        print("\tsimde_mm_store_si128((simde__m128i*)(base + ((");
++        print("\tPPC_GUEST_VSTORE(base + ((");
          if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+-        println("{}.u32) & ~0xF)), simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]), v(insn.operands[0]));
++        println("{}.u32) & ~0xF), simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]), v(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_STW:
 @@ -1831,7 +1876,17 @@ bool Recompiler::Recompile(
  
      case PPC_INST_VCMPBFP:
@@ -334,3 +386,85 @@ index fa91527..b8ad631 100644
          default:
              println("\t__builtin_debugtrap();");
              break;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..2754ec9 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -31,20 +31,49 @@
+ 
+ #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
+ 
++// Guest memory accesses (from ReXenon, FM2's XenonRecomp fork). Relaxed atomics by default: each access is
++// emitted once, at its width and in program order (never merged, split, removed or hoisted out of a spin loop),
++// like volatile, but unlike volatile they don't make the compiler reload every ctx register after each access.
++// (clang-cl compiles volatile with MSVC acquire/release semantics, which blocks all motion of other memory
++// accesses around it.) Guest ordering comes from lwsync/sync/eieio as on the console. Define
++// PPC_VOLATILE_GUEST_ACCESS for XenonRecomp's volatile accesses.
++#ifndef PPC_GUEST_LOAD
++#ifdef PPC_VOLATILE_GUEST_ACCESS
++#define PPC_GUEST_LOAD(T, p) (*(volatile T*)(p))
++#define PPC_GUEST_STORE(T, p, v) (*(volatile T*)(p) = (v))
++#else
++#define PPC_GUEST_LOAD(T, p) __atomic_load_n((T*)(p), __ATOMIC_RELAXED)
++#define PPC_GUEST_STORE(T, p, v) __atomic_store_n((T*)(p), (T)(v), __ATOMIC_RELAXED)
++#endif
++#endif
++
++// Guest vector accesses (lvx, lvlx, lvrx, stvx). Volatile, so the compiler can't merge, remove or reuse them across
++// the relaxed scalar accesses (a vector load re-read after a flag spin loop must be read again). A 16-byte volatile
++// is a plain volatile under clang-cl, not acquire/release.
++#ifndef PPC_GUEST_VLOAD
++#ifdef PPC_VOLATILE_GUEST_ACCESS
++#define PPC_GUEST_VLOAD(p) simde_mm_load_si128((simde__m128i*)(p))
++#define PPC_GUEST_VSTORE(p, v) simde_mm_store_si128((simde__m128i*)(p), (v))
++#else
++#define PPC_GUEST_VLOAD(p) (*(volatile simde__m128i*)(p))
++#define PPC_GUEST_VSTORE(p, v) (*(volatile simde__m128i*)(p) = (v))
++#endif
++#endif
++
+ #ifndef PPC_LOAD_U8
+-#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
++#define PPC_LOAD_U8(x) PPC_GUEST_LOAD(uint8_t, base + (x))
+ #endif
+ 
+ #ifndef PPC_LOAD_U16
+-#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
++#define PPC_LOAD_U16(x) __builtin_bswap16(PPC_GUEST_LOAD(uint16_t, base + (x)))
+ #endif
+ 
+ #ifndef PPC_LOAD_U32
+-#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
++#define PPC_LOAD_U32(x) __builtin_bswap32(PPC_GUEST_LOAD(uint32_t, base + (x)))
+ #endif
+ 
+ #ifndef PPC_LOAD_U64
+-#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
++#define PPC_LOAD_U64(x) __builtin_bswap64(PPC_GUEST_LOAD(uint64_t, base + (x)))
+ #endif
+ 
+ // TODO: Implement.
+@@ -68,19 +97,19 @@
+ #endif
+ 
+ #ifndef PPC_STORE_U8
+-#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
++#define PPC_STORE_U8(x, y) PPC_GUEST_STORE(uint8_t, base + (x), uint8_t(y))
+ #endif
+ 
+ #ifndef PPC_STORE_U16
+-#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
++#define PPC_STORE_U16(x, y) PPC_GUEST_STORE(uint16_t, base + (x), __builtin_bswap16(y))
+ #endif
+ 
+ #ifndef PPC_STORE_U32
+-#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
++#define PPC_STORE_U32(x, y) PPC_GUEST_STORE(uint32_t, base + (x), __builtin_bswap32(y))
+ #endif
+ 
+ #ifndef PPC_STORE_U64
+-#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
++#define PPC_STORE_U64(x, y) PPC_GUEST_STORE(uint64_t, base + (x), __builtin_bswap64(y))
+ #endif
+ 
+ // MMIO Store handling is completely reliant on being preeceded by eieio.

@@ -16,6 +16,8 @@
 
 #include "live_switch.h"
 #include "log.h"
+#include "settings.h"
+#include <cstring>
 
 namespace
 {
@@ -145,6 +147,135 @@ void InitGuestContext(PPCContext& ctx, GuestThread& thread)
 
 namespace
 {
+// PGR4_PIN (from FM2): affinity masks for guest threads, set as each one is created (from boot). Unset, it is
+// "auto" (below), or "off" when settings.ini has thread_pinning=0; PGR4_PIN=off pins nothing.
+// "1:3,8:C,*:F0" gives masks (hex) by guest thread id, '*' for the rest.
+// "auto": the main thread and the GPU command processor get a physical core each (all its logical processors;
+// a module on Bulldozer-family CPUs), from the fastest efficiency class, and every other guest thread gets the
+// remaining cores. Needs 4 cores or more in processor group 0; with fewer nothing is pinned. (FM2 on the
+// FX-8350: about +10%.)
+// "m:MASK" is the main thread's mask and "c:MASK" the command processor's, found by name.
+// "h:MASK" also keeps every other thread of the process (renderer, audio, the driver's) on those processors,
+// through the process's default CPU sets; "auto" adds h: with the remaining cores. The threads with their own
+// mask get matching CPU sets, so the default doesn't apply to them.
+struct PinSpec
+{
+    std::unordered_map<uint32_t, uint64_t> masks;
+    uint64_t rest = 0;
+    uint64_t mainThread = 0;
+    uint64_t commandProcessor = 0;
+    uint64_t host = 0;
+};
+
+// CPU set ids of the logical processors in mask (processor group 0).
+std::vector<ULONG> CpuSetIds(uint64_t mask)
+{
+    std::vector<ULONG> ids;
+    ULONG bytes = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
+    std::vector<uint8_t> buffer(bytes);
+    if (!bytes || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), bytes, &bytes, GetCurrentProcess(), 0))
+        return ids;
+    for (ULONG at = 0; at < bytes;)
+    {
+        auto* info = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + at);
+        if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+            (mask >> info->CpuSet.LogicalProcessorIndex & 1))
+            ids.push_back(info->CpuSet.Id);
+        at += info->Size;
+    }
+    return ids;
+}
+
+PinSpec ParsePinSpec()
+{
+    PinSpec pin;
+    const char* spec = getenv("PGR4_PIN");
+    if (!spec || !*spec)
+        spec = GetSettings().threadPinning ? "auto" : "off";
+    if (!strcmp(spec, "off"))
+    {
+        Log("pin: off");
+        return pin;
+    }
+    std::string autoSpec;
+    if (!strcmp(spec, "auto"))
+    {
+        DWORD bytes = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+        std::vector<uint8_t> buffer(bytes);
+        std::vector<std::pair<int, uint64_t>> cores; // efficiency class, mask
+        if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &bytes))
+            for (DWORD at = 0; at < bytes;)
+            {
+                auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + at);
+                if (info->Processor.GroupMask[0].Group == 0)
+                    cores.push_back({ info->Processor.EfficiencyClass, info->Processor.GroupMask[0].Mask });
+                at += info->Size;
+            }
+        if (cores.size() < 4)
+        {
+            Log("pin: auto needs 4 cores, found %zu", cores.size());
+            return pin;
+        }
+        std::stable_sort(cores.begin(), cores.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        uint64_t rest = 0;
+        for (size_t i = 2; i < cores.size(); i++)
+            rest |= cores[i].second;
+        char s[96];
+        snprintf(s, sizeof(s), "m:%llX,c:%llX,*:%llX,h:%llX", (unsigned long long)cores[0].second, (unsigned long long)cores[1].second,
+            (unsigned long long)rest, (unsigned long long)rest);
+        autoSpec = s;
+        spec = autoSpec.c_str();
+    }
+    Log("pin: %s", spec);
+    for (const char* p = spec; *p;)
+    {
+        const char key = *p == '*' || *p == 'h' || *p == 'c' || *p == 'm' ? *p : 0;
+        char* end;
+        const uint32_t id = key ? 0 : uint32_t(strtoul(p, &end, 10));
+        p = key ? p + 1 : end;
+        if (*p != ':')
+            break;
+        const uint64_t mask = strtoull(p + 1, &end, 16);
+        p = end;
+        (key == '*' ? pin.rest : key == 'h' ? pin.host : key == 'c' ? pin.commandProcessor : key == 'm' ? pin.mainThread : pin.masks[id]) = mask;
+        if (*p == ',')
+            ++p;
+    }
+    if (pin.host)
+    {
+        const std::vector<ULONG> ids = CpuSetIds(pin.host);
+        Log("pin: host threads -> %llX (%zu CPU sets, %s)", (unsigned long long)pin.host, ids.size(),
+            !ids.empty() && SetProcessDefaultCpuSets(GetCurrentProcess(), ids.data(), ULONG(ids.size())) ? "ok" : "failed");
+    }
+    return pin;
+}
+
+void PinGuestThread(GuestThread& t)
+{
+    static const PinSpec pin = ParsePinSpec();
+    auto it = pin.masks.find(t.id);
+    const uint64_t mask = it != pin.masks.end() ? it->second
+        : pin.commandProcessor && t.name == "gpu command processor" ? pin.commandProcessor
+        : pin.mainThread && t.name == "main" ? pin.mainThread
+        : pin.rest;
+    if (!mask)
+        return;
+    bool ok = SetThreadAffinityMask(HANDLE(t.hostHandle), DWORD_PTR(mask)) != 0;
+    if (pin.host)
+    {
+        // The process default would otherwise apply to this thread too (affinity beats CPU sets only when
+        // they don't overlap at all).
+        const std::vector<ULONG> ids = CpuSetIds(mask);
+        ok = ok && !ids.empty() && SetThreadSelectedCpuSets(HANDLE(t.hostHandle), ids.data(), ULONG(ids.size()));
+    }
+    Log("pin: t%u %s -> %llX (%s)", t.id, t.name.c_str(), (unsigned long long)mask, ok ? "ok" : "failed");
+}
+}
+
+namespace
+{
 std::shared_ptr<ThreadObject> StartThread(uint32_t entry, uint32_t param, uint32_t xapiStartup, uint32_t stackSize,
     bool suspended, const char* name, std::function<void(PPCContext&)> hostEntry)
 {
@@ -169,6 +300,7 @@ std::shared_ptr<ThreadObject> StartThread(uint32_t entry, uint32_t param, uint32
     if (!handle)
         Fatal("CreateThread failed (%lu)", GetLastError());
     object->thread->hostHandle = handle;
+    PinGuestThread(*object->thread);
 
     wchar_t wname[64];
     swprintf(wname, 64, L"guest %u %S", object->thread->id, name ? name : "");
@@ -682,6 +814,13 @@ void StartThreadProfiler()
                 symbol2->MaxNameLen = 255;
                 DWORD64 displacement2 = 0;
                 name += std::string(" < ") + (SymFromAddr(GetCurrentProcess(), addr, &displacement2, symbol2) ? symbol2->Name : "?");
+                // REGPU_SAMPLE_CALLER_LINES=1: the first caller's source line too (which memcpy call, say)
+                static LiveSwitch callerLines("REGPU_SAMPLE_CALLER_LINES");
+                IMAGEHLP_LINE64 line2{};
+                line2.SizeOfStruct = sizeof(line2);
+                DWORD lineDisplacement2 = 0;
+                if (callerLines && addr == up[0] && SymGetLineFromAddr64(GetCurrentProcess(), addr - 1, &lineDisplacement2, &line2))
+                    name += ":" + std::to_string(line2.LineNumber);
             }
             counts[name]++;
             samples++;

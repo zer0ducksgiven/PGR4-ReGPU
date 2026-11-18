@@ -19,6 +19,7 @@
 
 #include "render/presenter.h"
 #include "live_switch.h"
+#include "copy128.h"
 #include "settings.h"
 #include "kernel/imports.h"
 #include "kernel/thread.h"
@@ -870,12 +871,18 @@ void WriteRegister(uint32_t index, uint32_t value)
 
 // Bulk register writes from big-endian guest data (constant loads, register runs): the
 // register file is big-endian too, so a run clear of the scratch registers is a copy.
+// On AMD family 15h with 128-bit stores (Copy128): the CRT memcpy's AVX stores are slow there.
+const bool g_avxStoresSlow = AvxStoresSlow();
+LiveSwitch g_crtRegCopy("REGPU_CRT_REG_COPY"); // A/B: copy runs with the CRT memcpy on family 15h too
 void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
 {
     const bool lut = index <= DC_LUT_30_COLOR && index + count > DC_LUT_RW_INDEX;
     if (!lut && (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8))
     {
-        memcpy(gpureg::LiveFile() + index * 4, GuestPtr<uint8_t>(source), size_t(count) * 4);
+        if (g_avxStoresSlow && !g_crtRegCopy)
+            Copy128(gpureg::LiveFile() + index * 4, GuestPtr<uint8_t>(source), size_t(count) * 4);
+        else
+            memcpy(gpureg::LiveFile() + index * 4, GuestPtr<uint8_t>(source), size_t(count) * 4);
         if (seg::g_open)
             seg::Append(seg::kRegs, &index, 1, GuestPtr<uint32_t>(source), count);
         if (work::Active())
@@ -889,6 +896,17 @@ void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
 // (At namespace scope: a function-local static checks its initialisation guard on every packet.)
 const int g_gpuSlow = getenv("REGPU_GPUSLOW") ? atoi(getenv("REGPU_GPUSLOW")) : 0;
 LiveSwitch g_tracePredication("REGPU_TRACE_PRED");
+LiveSwitch g_lockedDrawCount("REGPU_LOCKED_COUNTERS"); // A/B: the draw and predicated-skip counts as locked adds
+LiveSwitch g_traceCallAlways("REGPU_TRACE_CALL_ALWAYS"); // A/B: call RendererTracing for every packet
+LiveSwitch g_noCpPrefetch("REGPU_CP_NO_PREFETCH");       // A/B: no prefetch of the command stream
+// Only this thread adds to the draw count (the stats log just reads it): a plain add, not a locked op per draw.
+inline void CountDraw()
+{
+    if (g_lockedDrawCount)
+        g_gpu.draws++;
+    else
+        g_gpu.draws.store(g_gpu.draws.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
 
 // Executes one packet at ptr; returns its size in dwords.
 uint32_t ExecutePacket(uint32_t ptr)
@@ -954,11 +972,17 @@ uint32_t ExecutePacket(uint32_t ptr)
             (g_gpu.binSelect & g_gpu.binMask) ? "run" : "skip");
     if (tracePredication && opcode == 0x2D && (header & 1) && (g_gpu.binSelect & g_gpu.binMask) && predLogged < 100000000)
         Log("pred: set constant %08X: %08X %08X %08X (count %u)", arg(0), count > 1 ? arg(1) : 0, count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0, count);
-    if (RendererTracing() && opcode != 0x10)
+    // (The inline armed check first: RendererTracing is a call, and this runs per packet.)
+    if ((g_traceCallAlways || RendererTraceArmed()) && RendererTracing() && opcode != 0x10)
         Log("pm4: op %02X count %u%s", opcode, count, (header & 1) && !(g_gpu.binSelect & g_gpu.binMask) ? " (predicated off)" : "");
     if ((header & 1) && !(g_gpu.binSelect & g_gpu.binMask))
     {
-        g_gpu.skippedPredicated++;
+        // Only this thread adds (the stats log just reads): a plain add, as CountDraw. A locked
+        // op also drains this thread's pending stores, ring writes included.
+        if (g_lockedDrawCount)
+            g_gpu.skippedPredicated++;
+        else
+            g_gpu.skippedPredicated.store(g_gpu.skippedPredicated.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         return 1 + count;
     }
     if (g_trace && opcode != 0x10)
@@ -1293,11 +1317,11 @@ uint32_t ExecutePacket(uint32_t ptr)
         break;
     }
     case 0x22: // DRAW_INDX: viz query, initiator, [index base, index size]
-        g_gpu.draws++;
+        CountDraw();
         SubmitDraw(arg(1), count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
         break;
     case 0x36: // DRAW_INDX_2: initiator, [inline indices]
-        g_gpu.draws++;
+        CountDraw();
         SubmitDraw(arg(0), 0, 0);
         break;
     case 0x46: // EVENT_WRITE
@@ -1316,9 +1340,16 @@ void ExecuteBuffer(uint32_t address, uint32_t dwords)
     auto& cursors = t_cursors;
     const size_t level = cursors.size();
     cursors.push_back({ address, address + dwords * 4 });
+    const uint32_t end = address + dwords * 4;
     for (uint32_t done = 0; done < dwords;)
     {
         const uint32_t ptr = address + done * 4;
+        // The title wrote these packets on another core: start on the lines ahead while this
+        // one runs (the header load was most of this loop's time on FM2). Only inside this buffer:
+        // past its end is usually the segment the title is still writing, and pulling those lines
+        // here makes its stores miss.
+        if (!g_noCpPrefetch && ptr + 256 < end)
+            _mm_prefetch(GuestPtr<const char>(ptr + 256), _MM_HINT_T0);
         cursors[level].next = ptr + PacketLength(LoadBE32(ptr)) * 4;
         done += ExecutePacket(ptr);
     }
@@ -1535,17 +1566,54 @@ void CommandProcessorLoop(PPCContext& ctx)
         static std::chrono::steady_clock::time_point idleSince, logSince = std::chrono::steady_clock::now();
         static double idleSeconds = 0;
         static bool idle = false;
+        // Idle wait (from FM3-ReGPU via FM2): once the ring has been empty for a while, wait ~100 us at a time on a
+        // high-resolution timer instead of spinning on Sleep(0). Under a frame cap or vsync the CP is idle most
+        // of each frame and the spin holds a whole core (power and heat on laptops and handhelds). Uncapped, the
+        // title queues work again within the threshold and never reaches the sleep. Default: sleep after 1000 us
+        // with vsync or a cap of 144 or less, else spin. REGPU_CP_IDLE_SLEEP_US=<n> (read twice a second, so
+        // live) overrides; 0 spins.
+        static std::chrono::steady_clock::time_point emptySince, sleepCheck;
+        static bool empty = false;
+        static int sleepAfterUs = -1;
         if (g_gpu.rptr == wptr)
         {
             seg::Flush(); // nothing more queued: translate what there is
+            const auto now = std::chrono::steady_clock::now();
             if (perf && !idle)
             {
                 idle = true;
-                idleSince = std::chrono::steady_clock::now();
+                idleSince = now;
             }
-            Sleep(0);
+            if (!empty)
+            {
+                empty = true;
+                emptySince = now;
+            }
+            if (now >= sleepCheck)
+            {
+                sleepCheck = now + std::chrono::milliseconds(500);
+                const Settings& s = GetSettings();
+                const char* v = getenv("REGPU_CP_IDLE_SLEEP_US");
+                const int us = v ? atoi(v) : (s.vsync || s.maxFps <= 144) ? 1000 : 0;
+                if (us != sleepAfterUs)
+                    Log("gpu: command processor idle wait: %s %d us", us > 0 ? "sleeps after" : "spins", us > 0 ? us : 0);
+                sleepAfterUs = us;
+            }
+            if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs))
+            {
+                thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                LARGE_INTEGER due;
+                due.QuadPart = -1000; // 100 us, relative, in 100 ns units
+                if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                    WaitForSingleObject(timer, INFINITE);
+                else
+                    Sleep(0);
+            }
+            else
+                Sleep(0);
             continue;
         }
+        empty = false;
         if (perf)
         {
             const auto now = std::chrono::steady_clock::now();
