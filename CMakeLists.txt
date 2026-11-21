@@ -11,7 +11,10 @@ endif()
 add_subdirectory(thirdparty/ReXenon EXCLUDE_FROM_ALL)
 
 # Recompiled game code (out/ppc: tools/recomp.sh from your own disc and title update; never committed).
-set(PGR4_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
+# -DPGR4_PPC_DIR=<folder> builds against other generated code (A/B tests).
+if(NOT PGR4_PPC_DIR)
+    set(PGR4_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
+endif()
 file(GLOB PGR4_PPC_SOURCES CONFIGURE_DEPENDS "${PGR4_PPC_DIR}/*.cpp")
 if(NOT PGR4_PPC_SOURCES)
     message(FATAL_ERROR "out/ppc is empty: run tools/recomp.sh first")
