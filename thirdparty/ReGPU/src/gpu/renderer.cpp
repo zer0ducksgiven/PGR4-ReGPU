@@ -2135,7 +2135,8 @@ FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 // fence queued, on the command-list replay thread, so the command processor (or draw thread) no longer waits for
 // the replay at every swap. g_asyncFrameEnded: the next frame starts in a pool list (BeginFrameIfNeeded).
 // g_asyncEndPending: queued and not yet run; other submissions wait for it first (FlushAsyncFrameEnd), so the
-// queue order and the fence values stay as they were. REGPU_SYNC_PRESENT=1 (live): the old frame end.
+// queue order and the fence values stay as they were. Opt-in, REGPU_ASYNC_FRAME_END=1 (live): no clear gain on
+// the FX (PGR4: 59.3/56.8 fps parked against 57.9/57.8, with 60 ms hitches in one run).
 bool g_asyncFrameEnded = false;
 std::atomic<bool> g_asyncEndPending{ false };
 thread_local bool t_inAsyncEnd = false;
@@ -11914,8 +11915,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
         if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
             shown = enhanced;
-    static LiveSwitch syncPresent("REGPU_SYNC_PRESENT");
-    const bool asyncEnd = !syncPresent;
+    static LiveSwitch asyncFrameEnd("REGPU_ASYNC_FRAME_END");
+    const bool asyncEnd = asyncFrameEnd;
     struct AsyncEnd
     {
         bool copy = false;
