@@ -272,6 +272,14 @@ std::vector<uint32_t> g_vs, g_ps;
 uint32_t g_vsAddress = 0, g_psAddress = 0;
 RendererTile g_tile;
 
+// A vector of dwords set to a copy of n (HotCopy: std::vector's assign is the CRT's memmove).
+void CopyCode(std::vector<uint32_t>& to, const uint32_t* from, size_t n)
+{
+    to.resize(n);
+    if (n)
+        HotCopy(to.data(), from, n * 4);
+}
+
 void TakeSnapshot()
 {
     if (g_snapCount == g_snaps.size())
@@ -280,9 +288,9 @@ void TakeSnapshot()
     s.logPos = g_log.size();
     s.drawsBefore = g_draws;
     s.regs.resize(0x8000 * 4); // (type-0 packets address registers up to 0x7FFF)
-    memcpy(s.regs.data(), gpureg::LiveFile(), s.regs.size());
-    s.vs = g_vs;
-    s.ps = g_ps;
+    HotCopy(s.regs.data(), gpureg::LiveFile(), s.regs.size());
+    CopyCode(s.vs, g_vs.data(), g_vs.size());
+    CopyCode(s.ps, g_ps.data(), g_ps.size());
     s.vsAddress = g_vsAddress;
     s.psAddress = g_psAddress;
     s.tile = g_tile;
@@ -290,10 +298,13 @@ void TakeSnapshot()
 
 void Append(uint32_t type, const uint32_t* a, uint32_t n, const uint32_t* b = nullptr, uint32_t nb = 0)
 {
-    g_log.push_back(type << 24 | (n + nb));
-    g_log.insert(g_log.end(), a, a + n);
+    const size_t at = g_log.size();
+    g_log.resize(at + 1 + n + nb);
+    uint32_t* p = g_log.data() + at;
+    p[0] = type << 24 | (n + nb);
+    HotCopy(p + 1, a, size_t(n) * 4);
     if (nb)
-        g_log.insert(g_log.end(), b, b + nb);
+        HotCopy(p + 1 + n, b, size_t(nb) * 4);
 }
 
 // Replays snapshot `first`'s records up to `endPos` on this thread (a worker or the CP).
@@ -480,7 +491,7 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
     {
         dwords = std::min<uint32_t>(dwords, 0x10000);
         auto& code = type == ShaderType::Vertex ? seg::g_vs : seg::g_ps;
-        code.assign(microcodeBE, microcodeBE + dwords);
+        seg::CopyCode(code, microcodeBE, dwords);
         (type == ShaderType::Vertex ? seg::g_vsAddress : seg::g_psAddress) = guestAddress;
         if (seg::g_open)
         {

@@ -46,6 +46,7 @@
 #include "fsr1_cs.h"
 #include <DirectXPackedVector.h>
 #include "live_switch.h"
+#include "copy128.h"
 #include "settings.h"
 #include "gpu/regs.h"
 #include "gpu/texture.h"
@@ -690,7 +691,7 @@ namespace
 
 // Shared caches used by draws on several threads (see DrawContext).
 std::recursive_mutex g_shaderMutex;  // shaders, pipelines, the compiler's maps
-std::recursive_mutex g_textureMutex; // textures, cubes, mip chains, bindless, texture memory, index arena
+std::recursive_mutex g_textureMutex; // textures, cubes, mip chains, bindless, texture memory (index arena: GetIndexBuffer's own)
 uint32_t g_zeroedEdramBase = ~0u; // EDRAM base a depth clear to zero has just emptied (BindSurfaces)
 std::mutex g_surfaceMutex;           // EDRAM surfaces
 // Parallel segments: texture uploads and copies a worker makes go to this list, executed
@@ -3130,7 +3131,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
     if (offset == ~0ull)
         return offset;
-    memcpy(f.ringCpu + offset, src, bytes);
+    HotCopy(f.ringCpu + offset, src, bytes);
     uploads.Put(key, g_r.frame, { offset, sample });
     return offset;
 }
@@ -3212,7 +3213,18 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
     static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
     const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
     const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
-    std::lock_guard textureLock(g_textureMutex);
+    // The index arena has a lock of its own: under the texture mutex, the draw pieces queued behind one
+    // another's texture and bindless work for index buffers (PGR4 on an FX-8350: ~3% of the command
+    // processor, translating a piece itself, waited there). REGPU_INDEX_TEXTURE_LOCK=1 (at launch: one
+    // lock for every thread): the texture mutex, as before.
+    static std::mutex indexMutex;
+    static const bool textureLock = getenv("REGPU_INDEX_TEXTURE_LOCK") != nullptr;
+    std::unique_lock<std::recursive_mutex> sharedLock(g_textureMutex, std::defer_lock);
+    std::unique_lock<std::mutex> ownLock(indexMutex, std::defer_lock);
+    if (textureLock)
+        sharedLock.lock();
+    else
+        ownLock.lock();
     g_indexChanging = false;
     if (!GetIndexBufferLocked(base, count, is32, endian, view, hash))
         return false;
@@ -10985,7 +10997,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const size_t vsFrom = hooked ? 0 : offsetof(VSConstants, b), psFrom = offsetof(PSConstants, b);
         auto put = [](void* ring, const void* stage, size_t from, size_t to) {
             if (to > from)
-                memcpy(static_cast<uint8_t*>(ring) + from, static_cast<const uint8_t*>(stage) + from, to - from);
+                HotCopy(static_cast<uint8_t*>(ring) + from, static_cast<const uint8_t*>(stage) + from, to - from);
         };
         if (fullBlocks)
         {

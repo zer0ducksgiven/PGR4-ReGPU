@@ -19,6 +19,8 @@
 
 #include <d3d12.h>
 
+#include "copy128.h"
+
 // REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them (counted only then:
 // an atomic increment per recorded call was ~1% of the command processor).
 inline std::atomic<uint64_t> g_recordedOps[32];
@@ -213,9 +215,9 @@ private:
         m_current.resize(at + sizeof(header) + header[1]);
         uint8_t* p = m_current.data() + at;
         memcpy(p, header, sizeof(header));
-        memcpy(p + sizeof(header), a, na);
+        HotCopy(p + sizeof(header), a, na);
         if (nb)
-            memcpy(p + sizeof(header) + na, b, nb);
+            HotCopy(p + sizeof(header) + na, b, nb);
         if (m_direct)
         {
             Replay(m_current.data(), m_current.size());

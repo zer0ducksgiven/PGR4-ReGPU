@@ -5,6 +5,7 @@
 // against ~1 for a 128-bit one. Same bytes either way. The buffers must not overlap.
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <emmintrin.h>
 #include <intrin.h>
@@ -56,4 +57,16 @@ inline void Copy128(void* dst, const void* src, size_t n)
     if (rest > 48)
         _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i + 32), _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + i + 32)));
     _mm_storeu_si128(reinterpret_cast<__m128i*>(d + n - 16), last);
+}
+
+// The command processor's other hot copies (vertex uploads, draw constants, the segment log, recorded
+// commands, register snapshots): Copy128 where 256-bit stores are slow, the CRT's memcpy elsewhere.
+// REGPU_CRT_HOT_COPY=1 (at launch): the CRT's everywhere (A/B).
+inline const bool g_hotCopy128 = AvxStoresSlow() && !getenv("REGPU_CRT_HOT_COPY");
+inline void HotCopy(void* dst, const void* src, size_t n)
+{
+    if (g_hotCopy128)
+        Copy128(dst, src, n);
+    else
+        memcpy(dst, src, n);
 }
