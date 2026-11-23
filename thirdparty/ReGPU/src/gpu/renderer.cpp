@@ -2887,32 +2887,50 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
     static std::mutex mutex; // the draw workers (REGPU_DRAW_WORKERS) check buffers too
     // Only draw pieces get here at once: the command processor thread on its own takes no lock.
     std::unique_lock lock(mutex, std::defer_lock);
-    if (C().worker || g_sw_REGPU_DYNAMIC_LOCK)
+    const bool locking = C().worker || g_sw_REGPU_DYNAMIC_LOCK;
+    if (locking)
         lock.lock();
-    Seen& s = seen[key];
+    Seen* s = &seen[key];
     // Hashing is the cost: a buffer that stopped changing (static geometry, most of them) is
     // checked every 16th frame, one that changes every frame.
-    const bool due = s.frame == ~0ull || g_r.frame <= s.dynamicUntil || g_r.frame >= s.frame + 16;
-    if (s.frame != g_r.frame && due)
+    const bool due = s->frame == ~0ull || g_r.frame <= s->dynamicUntil || g_r.frame >= s->frame + 16;
+    uint64_t hash = 0;
+    if (s->frame != g_r.frame && due)
     {
-        const uint64_t hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+        // Hashed outside the lock: the draw pieces otherwise queued behind one another's hashing of the
+        // buffers that change every frame (PGR4 on an FX-8350: ~1% of the command processor waited there).
+        // Two pieces may both hash a buffer; the first to finish records it. REGPU_DYNAMIC_HASH_LOCKED=1
+        // (at launch): hashed under the lock, as before.
+        static const bool hashLocked = getenv("REGPU_DYNAMIC_HASH_LOCKED") != nullptr;
+        const bool unlocked = locking && !hashLocked;
+        if (unlocked)
+            lock.unlock();
+        hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+        if (unlocked)
+        {
+            lock.lock();
+            s = &seen[key];
+        }
+    }
+    if (s->frame != g_r.frame && due)
+    {
         // A buffer seen changing once stays copied: one written in bursts (FH1's skid marks, appended
         // while the car slides) went back to being read in place 120 frames after its last change and
         // checked every 16th frame, so the next burst was read while the title wrote it (rare exploded
         // vertices on the marks). REGPU_DYNAMIC_EXPIRE=1: back to in place after 120 quiet frames, as before.
         static LiveSwitch expire("REGPU_DYNAMIC_EXPIRE");
-        if (s.frame != ~0ull && hash != s.hash)
-            s.dynamicUntil = expire ? g_r.frame + 120 : ~0ull;
+        if (s->frame != ~0ull && hash != s->hash)
+            s->dynamicUntil = expire ? g_r.frame + 120 : ~0ull;
         // A buffer seen for the first time is copied until it has stayed the same for 16 frames: with
         // early fences the title may rewrite it before the host GPU reads it, and ring-style buffers (FH1's
         // minimap blocks, skid marks, particles) keep appearing at new addresses and sizes, so read in place
         // at first sight they exploded when the GPU ran behind (busy scenes). REGPU_NEW_BUFFERS_IN_PLACE=1:
         // read in place until seen changing, as before.
         static LiveSwitch newInPlace("REGPU_NEW_BUFFERS_IN_PLACE");
-        if (s.frame == ~0ull && !newInPlace)
-            s.dynamicUntil = g_r.frame + 16;
-        s.hash = hash;
-        s.frame = g_r.frame;
+        if (s->frame == ~0ull && !newInPlace)
+            s->dynamicUntil = g_r.frame + 16;
+        s->hash = hash;
+        s->frame = g_r.frame;
         // REGPU_TRACE_DYNAMIC=1: the buffers being copied, every 600 frames.
         static LiveSwitch trace("REGPU_TRACE_DYNAMIC");
         static uint64_t lastLog = 0;
@@ -2935,8 +2953,8 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
             Log("dynamic: %u of %u large buffers copied, %llu KB", n, total, (unsigned long long)(bytesTotal >> 10));
         }
     }
-    const bool dynamic = g_r.frame <= s.dynamicUntil;
-    if (s.frame == g_r.frame)
+    const bool dynamic = g_r.frame <= s->dynamicUntil;
+    if (s->frame == g_r.frame)
         answered.Put(key, g_r.frame, dynamic);
     return dynamic;
 }

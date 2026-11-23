@@ -20,6 +20,7 @@
 #include "render/presenter.h"
 #include "live_switch.h"
 #include "copy128.h"
+#include "no_init_allocator.h"
 #include "settings.h"
 #include "kernel/imports.h"
 #include "kernel/thread.h"
@@ -259,7 +260,7 @@ struct Snapshot
     RendererTile tile;
 };
 bool g_open = false;
-std::vector<uint32_t> g_log;
+std::vector<uint32_t, NoInitAllocator<uint32_t>> g_log; // (resize in Append: no zero-fill)
 std::vector<Snapshot> g_snaps;
 size_t g_snapCount = 0; // used entries of g_snaps (kept allocated)
 uint32_t g_draws = 0;

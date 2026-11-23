@@ -20,6 +20,7 @@
 #include <d3d12.h>
 
 #include "copy128.h"
+#include "no_init_allocator.h"
 
 // REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them (counted only then:
 // an atomic increment per recorded call was ~1% of the command processor).
@@ -27,24 +28,6 @@ inline std::atomic<uint64_t> g_recordedOps[32];
 inline std::atomic<uint64_t> g_recordedBarriers{ 0 };
 inline const bool g_countRecorded = getenv("REGPU_PERF") != nullptr;
 
-// Bytes that are written right after the buffer grows: growing must not zero them first (resize's
-// value-initialisation was a memset per recorded call, ~3% of the command processor).
-template <typename T>
-struct NoInitAllocator : std::allocator<T>
-{
-    template <typename U>
-    struct rebind
-    {
-        using other = NoInitAllocator<U>;
-    };
-    NoInitAllocator() = default;
-    template <typename U>
-    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
-    template <typename U>
-    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) { ::new (static_cast<void*>(p)) U; }
-    template <typename U, typename... A>
-    void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
-};
 using RecordBytes = std::vector<uint8_t, NoInitAllocator<uint8_t>>;
 // REGPU_TRACE_BARRIERS: called with each barrier call's return address (renderer.cpp counts them).
 inline void (*g_barrierSites)(void* caller, UINT n, const D3D12_RESOURCE_BARRIER* b) = nullptr;
