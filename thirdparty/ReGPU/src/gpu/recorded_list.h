@@ -72,6 +72,14 @@ public:
         return m_real;
     }
 
+    // Returns once the RTV and DSV descriptors recorded so far are written (waiting for the replay only
+    // if one is still queued), for lists recorded elsewhere that use them.
+    void WaitForViews()
+    {
+        if (m_viewsReplayed.load(std::memory_order_acquire) < m_viewsPut)
+            Drain();
+    }
+
     void ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b)
     {
         if (g_barrierSites)
@@ -184,6 +192,8 @@ private:
     std::condition_variable m_work, m_idle;
     std::deque<RecordBytes> m_queue, m_spare;
     bool m_busy = false;
+    uint64_t m_viewsPut = 0; // views recorded (by the recording thread) and replayed (WaitForViews)
+    std::atomic<uint64_t> m_viewsReplayed{ 0 };
 
     void Put(Op op, const void* a, size_t na, const void* b = nullptr, size_t nb = 0)
     {
@@ -193,6 +203,8 @@ private:
                 g_recordedBarriers.fetch_add(*static_cast<const UINT*>(a), std::memory_order_relaxed);
             g_recordedOps[op].fetch_add(1, std::memory_order_relaxed);
         }
+        if (op == kCreateRtv || op == kCreateDsv)
+            m_viewsPut++;
         const size_t at = m_current.size();
         const uint32_t header[2] = { op, uint32_t((na + nb + 7) & ~size_t(7)) }; // 8-byte aligned commands
         m_current.resize(at + sizeof(header) + header[1]);
@@ -414,6 +426,7 @@ private:
                 struct A { ID3D12Device* d; ID3D12Resource* r; D3D12_CPU_DESCRIPTOR_HANDLE h; };
                 const A& c = At<A>(a);
                 c.d->CreateRenderTargetView(c.r, nullptr, c.h);
+                m_viewsReplayed.fetch_add(1, std::memory_order_release);
                 break;
             }
             case kCreateDsv:
@@ -421,6 +434,7 @@ private:
                 struct A { ID3D12Device* d; ID3D12Resource* r; D3D12_DEPTH_STENCIL_VIEW_DESC desc; D3D12_CPU_DESCRIPTOR_HANDLE h; };
                 const A& c = At<A>(a);
                 c.d->CreateDepthStencilView(c.r, &c.desc, c.h);
+                m_viewsReplayed.fetch_add(1, std::memory_order_release);
                 break;
             }
             case kClearDsv:

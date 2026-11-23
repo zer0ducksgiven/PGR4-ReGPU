@@ -4969,7 +4969,18 @@ std::chrono::steady_clock::time_point g_lastLongHold{}; // end of the last hold 
 bool GameSettled()
 {
     static LiveSwitch never("REGPU_NO_SETTLED_SKIP");
-    return !never && g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
+    if (never || g_lastLongHold.time_since_epoch().count() == 0)
+        return false;
+    // Asked for every draw: once settled, stays so until the next hold (reading the clock per
+    // draw was ~1% of the command processor on the FX-8350)
+    thread_local std::chrono::steady_clock::time_point settledHold{};
+    const auto hold = g_lastLongHold;
+    if (hold == settledHold)
+        return true;
+    if (std::chrono::steady_clock::now() - hold <= std::chrono::seconds(4))
+        return false;
+    settledHold = hold;
+    return true;
 }
 
 // Set by the draw: a rectangle list without textures (a clear, a stencil reset, a mask fill).
@@ -9535,10 +9546,19 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
         }
     } done{ segmentStart };
     BeginFrameIfNeeded();
-    // Waiting for the replay here, not handed off: the pieces call the driver directly, and the main stream's
-    // render target views they bind (created in order in it) must exist by then (the D3D12 debug layer:
-    // "descriptor handle has not been initialized"; AMD GPUs hung in races, 0.1.2-0.1.4).
-    SplitMainList();
+    // The pieces call the driver directly, and the main stream's render target views they bind (created
+    // in order in it) must exist by then (the D3D12 debug layer: "descriptor handle has not been
+    // initialized"; AMD GPUs hung in races, 0.1.2-0.1.4). The split is handed off and only the views are
+    // waited for, not the whole replay (that wait was ~3% of the command processor on the FX-8350).
+    // REGPU_DRAIN_BEFORE_PIECES=1 (at launch): waits for the replay as before (A/B).
+    static const bool drainBeforePieces = getenv("REGPU_DRAIN_BEFORE_PIECES") != nullptr;
+    if (drainBeforePieces)
+        SplitMainList();
+    else
+    {
+        SplitMainListAsync(false);
+        g_r.recorder.WaitForViews();
+    }
     // Texture uploads of the pieces, executed before them.
     ID3D12GraphicsCommandList* prepReal = AcquireList();
     RecordedList prep;
