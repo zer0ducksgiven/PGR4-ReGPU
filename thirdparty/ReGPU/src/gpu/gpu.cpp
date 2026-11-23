@@ -1406,7 +1406,39 @@ void ExecuteBuffer(uint32_t address, uint32_t dwords)
         // here makes its stores miss.
         if (!g_noCpPrefetch && ptr + 256 < end)
             _mm_prefetch(GuestPtr<const char>(ptr + 256), _MM_HINT_T0);
-        cursors[level].next = ptr + PacketLength(LoadBE32(ptr)) * 4;
+        const uint32_t header = LoadBE32(ptr);
+        // A run of type-2 NOPs (padding) is checked against the pending swap blocks once, not NOP by NOP
+        // (each one passed the swap filter and scanned all sixteen: ~2% of the command processor in a
+        // PGR4 race on the FX-8350). The NOPs before a swap block are skipped; the block itself runs as
+        // a packet. REGPU_NOP_EACH=1 (at launch): one at a time, as before.
+        static const bool nopEach = getenv("REGPU_NOP_EACH") != nullptr;
+        if (header >> 30 == 2 && !nopEach)
+        {
+            uint32_t n = 1;
+            while (done + n < dwords && LoadBE32(ptr + n * 4) >> 30 == 2)
+                n++;
+            // Most runs are one NOP, tens of thousands a frame, and the swap filter passes them: the sixteen
+            // blocks are compared four at a time ((block - lo) < bytes, unsigned), one by one only on a hit.
+            const uint32_t lo = ptr & 0x1FFFFFFF;
+            const __m128i bias = _mm_set1_epi32(int(0x80000000u));
+            const __m128i base = _mm_set1_epi32(int(lo)), limit = _mm_xor_si128(_mm_set1_epi32(int(n * 4)), bias);
+            static_assert(sizeof(g_gpu.swapBlocks) == 64, "sixteen plain dwords");
+            const auto* blocks = reinterpret_cast<const __m128i*>(g_gpu.swapBlocks);
+            int hit = 0;
+            for (int q = 0; q < 4; q++)
+                hit |= _mm_movemask_epi8(_mm_cmplt_epi32(_mm_xor_si128(_mm_sub_epi32(_mm_loadu_si128(blocks + q), base), bias), limit));
+            uint32_t skip = n;
+            if (hit)
+                for (const auto& b : g_gpu.swapBlocks)
+                    if (const uint32_t block = b.load(std::memory_order_acquire); block - lo < n * 4)
+                        skip = std::min(skip, (block - lo) / 4);
+            if (skip)
+            {
+                done += skip;
+                continue;
+            }
+        }
+        cursors[level].next = ptr + PacketLength(header) * 4;
         done += ExecutePacket(ptr);
     }
     cursors.pop_back();
