@@ -287,6 +287,7 @@ UINT64 kRingSize = 64ull << 20;
 // at its next start (its GPU work done), so only that one frame drops draws.
 constexpr UINT64 kRingMax = 2048ull << 20;
 std::atomic<UINT64> g_ringWant{ 0 };
+std::atomic<uint64_t> g_ringEpoch{ 1 }; // bumped at every ring reset: the threads' chunks of it (RingAlloc) are stale
 UINT64 g_ringPeak = 0;
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
@@ -2780,6 +2781,7 @@ void BeginFrameIfNeeded()
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
     f.ringUsed = 0;
+    g_ringEpoch.fetch_add(1, std::memory_order_relaxed);
     f.uploads.clear();
     // Guest memory not mapped at init: try again a few times (see MapGuestMemory).
     if (!g_r.physical && (g_r.frame == 30 || g_r.frame == 120 || g_r.frame == 600 || g_r.frame == 2400) && !getenv("REGPU_NO_MAP_RETRY"))
@@ -2815,7 +2817,7 @@ void BeginFrameIfNeeded()
 }
 
 // Allocates from the frame's upload ring; returns the offset (or ~0).
-UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
+UINT64 RingAllocShared(UINT64 bytes, UINT64 alignment)
 {
     FrameResources& f = Frame();
     UINT64 used = f.ringUsed.load(std::memory_order_relaxed), offset;
@@ -2839,6 +2841,38 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
         }
         return ~0ull;
     }
+    return offset;
+}
+
+// Small blocks come from a chunk of the ring each thread takes for itself: the command processor and
+// the draw workers otherwise took turns at the one counter, two or more times a draw (its compare-and-swap
+// was ~1.8% of the command processor, PGR4 on an FX-8350, and halving the calls did not change it).
+// REGPU_RING_NO_CHUNKS=1 (at launch): every block from the shared counter, as before.
+UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
+{
+    static const bool noChunks = getenv("REGPU_RING_NO_CHUNKS") != nullptr;
+    constexpr UINT64 kChunk = 256 << 10, kSmall = 16 << 10;
+    if (noChunks || bytes > kSmall || alignment > 512)
+        return RingAllocShared(bytes, alignment);
+    struct Chunk
+    {
+        const FrameResources* frame = nullptr;
+        uint64_t epoch = 0;
+        UINT64 next = 0, end = 0;
+    };
+    thread_local Chunk c;
+    const FrameResources* f = &Frame();
+    const uint64_t epoch = g_ringEpoch.load(std::memory_order_relaxed);
+    UINT64 offset = (c.next + alignment - 1) & ~(alignment - 1);
+    if (c.frame != f || c.epoch != epoch || offset + bytes > c.end)
+    {
+        const UINT64 base = RingAllocShared(kChunk, 512);
+        if (base == ~0ull)
+            return RingAllocShared(bytes, alignment); // the ring's tail, or ~0 (the ring grows next time)
+        c = { f, epoch, base, base + kChunk };
+        offset = base;
+    }
+    c.next = offset + bytes;
     return offset;
 }
 
