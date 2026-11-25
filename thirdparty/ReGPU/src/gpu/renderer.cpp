@@ -8600,20 +8600,32 @@ void QueueClosedAndSubmit(ID3D12GraphicsCommandList* closed, void* ctx)
     QueueClosed(closed, ctx);
     SubmitLists(0, nullptr);
 }
-void SplitMainListAsync(bool submit)
+// With signal, the host fence is signalled to that value after the submission, on the replay thread too
+// (every other signal drains the replay first, so the values stay in order).
+void QueueClosedSubmitAndSignal(ID3D12GraphicsCommandList* closed, void* ctx)
+{
+    QueueClosedAndSubmit(closed, ctx);
+    g_r.queue->Signal(g_r.fence.Get(), uint64_t(uintptr_t(ctx)));
+}
+void SplitMainListAsync(bool submit, uint64_t signal = 0)
 {
     static LiveSwitch sync("REGPU_SYNC_SPLITS"); // (A/B: wait for the replay as before)
     if (sync)
     {
         SplitMainList();
-        if (submit)
+        if (submit || signal)
             SubmitLists(0, nullptr);
+        if (signal)
+            g_r.queue->Signal(g_r.fence.Get(), signal);
         return;
     }
     const bool queryOpen = g_occlusionOpen;
     if (queryOpen)
         EndOcclusionPart();
-    g_r.recorder.HandOff(AcquireList(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
+    if (signal)
+        g_r.recorder.HandOff(AcquireList(), QueueClosedSubmitAndSignal, reinterpret_cast<void*>(uintptr_t(signal)));
+    else
+        g_r.recorder.HandOff(AcquireList(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
     ListPrologue(g_r.recorder);
     g_drawState.Invalidate();
     SelectSurfaces(true);
@@ -8945,10 +8957,20 @@ uint64_t FenceSubmitImpl()
     lastFrame = g_r.frame;
     lastDraws = draws;
     BeginFrameIfNeeded();
-    SplitMainList();
-    SubmitLists(0, nullptr); // (the signal must follow this fence's draws)
+    // The split, submission and signal are handed to the replay thread rather than waited for here (the
+    // wait for the replay was ~2.6% of the command processor in PGR4 on the FX-8350, with the list's Close
+    // another ~1.7%). The fence writer waits on the value either way. REGPU_SYNC_FENCE_SPLITS=1 (live):
+    // waits as before.
+    static LiveSwitch syncSplit("REGPU_SYNC_FENCE_SPLITS");
     lastValue = g_r.nextFence++;
-    g_r.queue->Signal(g_r.fence.Get(), lastValue);
+    if (syncSplit)
+    {
+        SplitMainList();
+        SubmitLists(0, nullptr); // (the signal must follow this fence's draws)
+        g_r.queue->Signal(g_r.fence.Get(), lastValue);
+    }
+    else
+        SplitMainListAsync(true, lastValue);
     if (FenceWritebacks())
     {
         // The write-backs recorded before this fence: the fence writer lands them before the fence.
