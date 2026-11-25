@@ -9059,6 +9059,12 @@ namespace
 void WorkerMain()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw piece worker");
+    // Above normal: the command processor waits at each segment's end for the slowest piece, and a worker
+    // sharing its cores with the game's own threads finished late (PGR4 on an FX-8350, where the workers and
+    // the game's threads are pinned to the same four cores: +1 fps driving, +0.6 parked).
+    // REGPU_WORKER_PRIORITY=n (at launch, -2..2): this priority instead (0: normal, as before).
+    const char* priority = getenv("REGPU_WORKER_PRIORITY");
+    SetThreadPriority(GetCurrentThread(), priority ? std::clamp(atoi(priority), -2, 2) : THREAD_PRIORITY_ABOVE_NORMAL);
     if (!g_profiledWorker)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
     DrawContext ctx;
