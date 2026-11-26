@@ -122,8 +122,14 @@ void GpuStart()
         _putenv_s("REGPU_NO_FENCE_ORDER", "1");
     if (!getenv("REGPU_DRAW_WORKERS") && on(s.drawWorkers) && std::thread::hardware_concurrency() >= 6)
         _putenv_s("REGPU_DRAW_WORKERS", "3");
-    if (!getenv("REGPU_SYNC_SPLITS") && !on(s.asyncSplits))
-        _putenv_s("REGPU_SYNC_SPLITS", "1");
+    // async_splits=0 covers the splits at fences too (handed to the replay thread since 0.3.0).
+    if (!on(s.asyncSplits))
+    {
+        if (!getenv("REGPU_SYNC_SPLITS"))
+            _putenv_s("REGPU_SYNC_SPLITS", "1");
+        if (!getenv("REGPU_SYNC_FENCE_SPLITS"))
+            _putenv_s("REGPU_SYNC_FENCE_SPLITS", "1");
+    }
     // The launcher's "Hide the shader compiler box" (the first-boot screen stays).
     if (s.hideShaderOverlay && !getenv("REGPU_NO_OVERLAY"))
         _putenv_s("REGPU_NO_OVERLAY", "1");
